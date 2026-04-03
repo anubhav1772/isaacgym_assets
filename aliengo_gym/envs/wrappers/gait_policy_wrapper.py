@@ -1,0 +1,1934 @@
+import gym
+import torch
+import numpy as np
+from isaacgym.torch_utils import quat_apply, normalize
+from aliengo_gym.utils.math_utils import quat_apply_yaw, wrap_to_pi, get_scale_shift
+from aliengo_gym.envs.base.curriculum import RewardThresholdCurriculum
+from aliengo_gym.utils.logger import Logger
+from scipy.spatial.transform import Rotation as R
+from aliengo_gym.utils.helpers import dict_to_env_cfg
+
+import os
+import matplotlib.pyplot as plt
+
+
+class GaitPolicyWrapper(gym.Wrapper):
+    """
+    env action = gait params (from Policy 1)
+    produces torques by calling Policy 2 internally
+    """
+
+    def __init__(self, env, policy2, cfg):
+        super().__init__(env)
+        self.env = env
+        self.wtw = policy2                  # frozen locomotion controller (WTW)
+        self.cfg = cfg
+        self.device = env.device
+        self.enable_curriculum = False      # default
+        self.obs_scales = cfg.obs_scales
+
+        self.num_envs = cfg.env.num_envs
+        self.dt = env.dt
+        self.num_gaits = cfg.env.num_gaits
+
+        self.reward_scales = vars(cfg.reward_scales)
+
+        # allocate buffer for gait params
+        self.gaits = torch.zeros(self.cfg.env.num_envs, self.cfg.env.num_gaits, dtype=torch.float,
+                                device=self.env.device, requires_grad=False)
+        # store last gait params
+        self.last_gaits = torch.zeros_like(self.gaits)
+        self.current_vel_cmds = torch.zeros(self.cfg.env.num_envs, 3, dtype=torch.float, device=self.env.device, requires_grad=False)
+
+        self.pi1_obs_history_length = self.cfg.env.num_observation_history
+        self.pi1_obs_dim = self.cfg.env.num_observations
+        self.num_pi1_obs_history = self.pi1_obs_history_length * self.pi1_obs_dim
+
+        self.last_pi2_obs = None
+
+        # Obs History [num_envs, num_observation_history * pi1_obs_dim]
+        self.pi1_obs_history = torch.zeros(self.env.num_envs, self.num_pi1_obs_history,
+                                        dtype=torch.float, device=self.device, requires_grad=False)
+
+        # Privileged Obs
+        self.num_pi1_privileged_obs = self.cfg.env.num_privileged_obs
+        self.privileged_pi1_obss = torch.zeros(self.env.num_envs, self.num_pi1_privileged_obs,
+                                        dtype=torch.float, device=self.device, requires_grad=False)
+
+        # Noise
+        #self.noise_scale_vec = self._get_noise_scale_vec(cfg)
+        self.add_noise = self.cfg.noise.add_noise
+        self.lin_vel_scale = torch.tensor([self.cfg.obs_scales.lin_vel,          # vx scale
+                                        2.0 * self.cfg.obs_scales.lin_vel],      # vy scale
+                                        device=self.device
+        )
+        wtw_freq = 1.0 / env.dt        # env.env.dt = env.env.sim_params.dt * env.env.cfg.control.decimation
+        policy1_freq = 2
+        self.hl_decimation = max(1, int(round(wtw_freq / policy1_freq)))
+
+        self.win_len = self.hl_decimation
+        self.torques_buf = torch.zeros(self.num_envs, self.win_len, 12, device=self.device)
+        self.dof_vel_buf = torch.zeros(self.num_envs, self.win_len, 12, device=self.device)
+        self.lin_vel_buf = torch.zeros(self.num_envs, self.win_len, 3, device=self.device)
+        self.ang_vel_buf = torch.zeros(self.num_envs, self.win_len, 3, device=self.device)
+        self.dof_vel_buf = torch.zeros(self.num_envs, self.win_len, 12, device=self.device)
+        #self.power_buf   = torch.zeros(self.num_envs, self.win_len, device=self.device)
+        self.energy_buf   = torch.zeros(self.num_envs, self.win_len, device=self.device)
+        self.alive = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        #self.rew_ll_buf = torch.zeros(self.num_envs, self.win_len, device=self.device) # (num_envs, win_len)
+
+        self.gait_ranges = torch.tensor(self._get_gait_ranges(), dtype=torch.float32, device=self.device)
+        #print(f"gait ranges: {self.gait_ranges}")
+
+        # self._prepare_reward_function()
+
+        self.global_step = 0
+
+        self.episode_sums = {
+            "energy": torch.zeros(self.num_envs, device=self.device),
+            "gait_smoothness": torch.zeros(self.num_envs, device=self.device),
+            "tracking": torch.zeros(self.num_envs, device=self.device),
+            "rew_ll": torch.zeros(self.num_envs, device=self.device),
+            # "tracking_lin": torch.zeros(self.num_envs, device=self.device),
+            # "tracking_ang": torch.zeros(self.num_envs, device=self.device),
+            "total_reward": torch.zeros(self.num_envs, device=self.device),
+        }
+
+        # FOR  EVALUATION ONLY
+        # self.pi1_dir = "/media/human/26618FC622E3D8BE/anubhav/unio4-efficient-aliengo/WTW-Aliengo/runs/gait-conditioned-agility/2026-01-19/train_gait_generator/085905.244570"
+
+    def step(self, gaits):
+        """
+        gaits: Policy 1 actions, shape [num_envs, num_gaits]
+        """
+        """
+        if self.global_step == 300 * 24: # 1 PPO = 24 HL Steps. 1 HL step = 25 LL steps
+            print("Stage 1 called!!")
+            self._set_velocity_range(1)
+            env_ids = torch.arange(self.num_envs, device=self.device)
+            self._sample_velocity_commands(env_ids)
+
+        elif self.global_step == 450 * 24:
+            print("Stage 2 called")
+            self._set_velocity_range(2)
+            env_ids = torch.arange(self.num_envs, device=self.device)
+            self._sample_velocity_commands(env_ids)
+        """
+        distance = torch.zeros(self.num_envs, device=self.device)
+        distance_masked = torch.zeros(self.num_envs, device=self.device)
+        done = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        #alive = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        valid_counts = torch.zeros(self.num_envs, device=self.device)
+        rew_accum = torch.zeros(self.num_envs, device=self.device)
+
+        info_hl = {}
+
+        self.lin_vel_buf.zero_()
+        self.ang_vel_buf.zero_()
+        #self.power_buf.zero_()
+        self.energy_buf.zero_()
+        self.dof_vel_buf.zero_()
+        self.torques_buf.zero_()
+        #self.rew_ll_buf.zero_()
+
+        self.gaits[:] = gaits
+        self.dgaits = self.gaits - self.last_gaits
+
+        # Inject velocity commands + generated gaits into underlying env for Policy 2
+        alive_ids = self.alive.nonzero(as_tuple=False).squeeze(-1)
+        # self.wtw.set_env_commands(vel_cmds=self.current_vel_cmds, gait_params=self.gaits, env_ids=alive_ids)
+        # gaits (HL actions)
+        self.env.commands[alive_ids, :3] = self.current_vel_cmds[alive_ids]
+        # velocities (task command)
+        self.env.commands[:, 3:3 + self.gaits.shape[1]] = self.gaits
+
+        for i in range(self.win_len):
+            if not self.alive.any():
+                break
+            alive_pre_step = self.alive.clone()
+            with torch.no_grad():
+                action_pi2 = self.wtw.policy(self.last_pi2_obs)
+
+            obs_pi2_next, rew_pi2, done_step, info = self.env.step(action_pi2)
+            self.last_pi2_obs = obs_pi2_next
+
+            # FOR Evaluation Purpose only
+            # self._log_info()
+
+            done_step = done_step.bool()
+            # Count this LL step if env was alive at step start
+            valid_counts[alive_pre_step] += 1
+
+            # physics truth
+            lin_vels = self.env.base_lin_vel
+            ang_vels = self.env.base_ang_vel
+            dof_vels = self.env.dof_vel
+            torques = self.env.torques
+
+            mask = self.alive[:, None]
+
+            self.lin_vel_buf[:, i, :] = lin_vels * mask
+            self.ang_vel_buf[:, i, :] = ang_vels * mask
+            self.torques_buf[:, i, :] = torques * mask
+            self.dof_vel_buf[:, i, :] = dof_vels * mask
+
+            # LL reward (window-normalized)
+            rew_accum += rew_pi2 * self.alive.float() / self.win_len
+
+            # power
+            #power_step = torch.sum(torch.abs(self.env.torques * self.env.dof_vel), dim=1)  # shape: [num_envs]
+            #self.power_buf[:, i] = power_step * mask.squeeze(1)
+            energy_step = torch.sum(torch.abs(self.env.torques * self.env.dof_vel), dim=1) * self.dt
+            self.energy_buf[:, i] = energy_step * self.alive.float()
+
+            distance_masked[self.alive] += (torch.norm(self.lin_vel_buf[self.alive, i, :2], dim=1) * self.dt)
+
+            # Update alive mask
+            newly_done = done_step & self.alive
+            done = done | newly_done
+            self.alive &= ~newly_done
+
+        valid_counts = torch.clamp(valid_counts, min=1.0)
+
+        # Means only for logging / obs
+        lin_vel_mean = self.lin_vel_buf.mean(dim=1)
+        ang_vel_mean = self.ang_vel_buf.mean(dim=1)
+        reward_ll = 50 * rew_accum
+
+        #power_total = self.power_buf.sum(dim=1)
+        power_total = torch.sum(torch.abs(self.torques_buf * self.dof_vel_buf),dim=(1, 2))
+        mean_power = power_total / valid_counts
+        #mean_power = power_total / self.win_len                       # J
+        energy = self.energy_buf.sum(dim=1)
+
+        distance = torch.clamp(distance_masked, min=1e-3)
+        cot_dist = torch.clamp(energy / (self.cfg.env.mg * distance + 1e-6), 0, 4)
+        cot_vel = torch.clamp(power_total / (self.cfg.env.mg * torch.abs(lin_vel_mean[:, 0]) + 1e-6), 0, 400)
+        info_hl["cot_vel"] = cot_vel.detach().mean().item()
+        info_hl["cot_dist"] = cot_dist.detach().mean().item()
+
+        rew_smooth  = self._reward_gait_smooth()
+        rew_energy = self._reward_energy_regularization(power_total, lin_vel_mean, ang_vel_mean)
+        reward_hl = rew_energy + 0.15 * rew_smooth
+        #rew_energy = torch.exp(-cot)
+
+        # mask = self.alive.float()
+        # reward_hl *= mask
+
+        exec_mask = (valid_counts > 0).float()
+        reward_hl *= exec_mask
+
+        rew_log = torch.log(reward_ll + reward_hl + 1e-6)
+        rew_centered = rew_log - rew_log.mean().detach()
+        rew_scaled = 3.0 * rew_centered
+        reward = torch.clamp(rew_scaled, -2.0, 2.0)
+
+        vx_cmd = self.current_vel_cmds[:, 0]
+        vy_cmd = self.current_vel_cmds[:, 1]
+        yaw_cmd = self.current_vel_cmds[:, 2]
+        #vx_cmd, vy_cmd, yaw_cmd = self.current_vel_cmds.T
+
+        vx = lin_vel_mean[:, 0]
+        vy = lin_vel_mean[:, 1]
+        #vx, vy, _ = lin_vel_mean.T
+        yaw = ang_vel_mean[:, 2]
+
+        # Episode sums
+        # self.episode_sums["energy"] += rew_energy * mask
+        # self.episode_sums["gait_smoothness"] += rew_smooth * mask
+        # self.episode_sums["rew_ll"] += reward_ll * mask
+        # # self.episode_sums["tracking_lin"] += rew_lin * mask
+        # # self.episode_sums["tracking_ang"] += rew_ang * mask
+        # self.episode_sums["total_reward"] += reward * mask # doesn't make sense because of log
+
+        # ep_mask = (valid_counts > 0).float()
+
+        self.episode_sums["energy"] += rew_energy * exec_mask
+        self.episode_sums["gait_smoothness"] += rew_smooth * exec_mask
+        self.episode_sums["rew_ll"] += reward_ll * exec_mask
+        # self.episode_sums["tracking_lin"] += rew_lin * exec_mask
+        # self.episode_sums["tracking_ang"] += rew_ang * exec_mask
+        self.episode_sums["total_reward"] += reward * exec_mask
+
+        if done.any():
+
+            info_hl["train/episode"] = {}
+
+            done_ids = done.nonzero(as_tuple=False).squeeze(-1)
+
+            # Total accumulated energy over the whole episode
+            # Only for envs that just finished
+            info_hl["train/episode"]["rew_energy"] = (
+                self.episode_sums["energy"][done_ids].mean().item()
+            )
+            info_hl["train/episode"]["rew_total"] = (
+                self.episode_sums["total_reward"][done_ids].mean().item()
+            )
+            info_hl["train/episode"]["rew_gait_smoothness"] = (
+                self.episode_sums["gait_smoothness"][done_ids].mean().item()
+            )
+            info_hl["train/episode"]["rew_ll"] = (
+                self.episode_sums["rew_ll"][done_ids].mean().item()
+            )
+            # info_hl["train/episode"]["rew_tracking_lin"] = (
+            #     self.episode_sums["tracking_lin"][done_ids].mean().item()
+            # )
+            # info_hl["train/episode"]["rew_tracking_ang"] = (
+            #     self.episode_sums["tracking_ang"][done_ids].mean().item()
+            # )
+            # reset per-env episode sums
+            for k in self.episode_sums:
+                self.episode_sums[k][done_ids] = 0.0
+
+        if "train/step" not in info_hl:
+            info_hl["train/step"] = {}
+
+        if "train/debug" not in info_hl:
+            info_hl["train/debug"] = {}
+
+        info_hl["train/step"]["valid_counts_mean"] = valid_counts.mean().item()
+        info_hl["train/step"]["valid_counts_min"]  = valid_counts.min().item()
+        info_hl["train/step"]["valid_counts_max"]  = valid_counts.max().item()
+
+        valid_envs = valid_counts > 0
+
+        #self.episode_sums["rew_ll"][valid_envs] += (rew_ll_win[valid_envs] / valid_counts[valid_envs])
+        # Step-wise metrics
+        info_hl["train/step"]["rew_energy"] = rew_energy[valid_envs].detach().mean().item()
+        info_hl["train/step"]["rew_smooth"] = rew_smooth[valid_envs].detach().mean().item()
+        info_hl["train/step"]["rew_ll_mean"] = reward_ll[valid_envs].detach().mean().item()
+        info_hl['train/step']["rew_ll_min"] = reward_ll[valid_envs].detach().min().item()
+        info_hl['train/step']["rew_ll_max"] = reward_ll[valid_envs].detach().max().item()
+        # info_hl["train/step"]["rew_tracking_lin"] = rew_lin[valid_envs].mean().item()
+        # info_hl["train/step"]["rew_tracking_ang"] = rew_ang[valid_envs].mean().item()
+        info_hl["train/step"]["rew_mean"] = reward[valid_envs].detach().mean().item()
+        info_hl["train/step"]["rew_min"] = reward[valid_envs].detach().min().item()
+        info_hl["train/step"]["rew_max"] = reward[valid_envs].detach().max().item()
+
+        info_hl["train/debug"]["log_rew_centered_std"] = rew_centered.detach().std().item()
+        info_hl["train/debug"]["log_rew_centered_max"] = rew_centered.detach().std().item()
+        info_hl["train/debug"]["log_rew_centered_min"] = rew_centered.detach().std().item()
+        info_hl["train/debug"]["reward_scaled_p95"] = torch.quantile(rew_scaled.detach().abs(), 0.95).item()
+        info_hl["train/debug"]["reward_scaled_p99"] = torch.quantile(rew_scaled.detach().abs(), 0.99).item()
+        info_hl["train/debug"]["reward_clip_frac"] = ((rew_scaled.detach().abs() > 2.0).float().mean().item())
+
+        info_hl["train/step"]["vx_cmd_abs"] = vx_cmd[valid_envs].detach().abs().mean().item()
+        info_hl["train/step"]["vx_abs"] = vx[valid_envs].detach().abs().mean().item()
+        #info_hl["train/step"]["vx_ratio"] = ((vx.abs() / (vx_cmd.abs() + 1e-6))[valid_envs].mean().item())
+        cmd_mask = (vx_cmd.abs() > 0.1) & valid_envs
+        if cmd_mask.any():
+            info_hl["train/step"]["vx_ratio"] = (
+                (vx.detach().abs() / vx_cmd.detach().abs())[cmd_mask].mean().item()
+            )
+        else:
+            info_hl["train/step"]["vx_ratio"] = 0.0
+        # info_hl["train/step"]["vx_err"] = ((vx_cmd[valid_envs] - vx[valid_envs]) ** 2).mean().item()
+        info_hl["train/step"]["vx_err"] = (vx_cmd[valid_envs] - vx[valid_envs]).detach().abs().mean().item()
+
+        # info_hl["train/step"]["yaw_cmd_abs"] = yaw_cmd[valid_envs].abs().mean().item()
+        # info_hl["train/step"]["yaw_abs"] = yaw[valid_envs].abs().mean().item()
+        # info_hl["train/step"]["yaw_err"] = ((yaw_cmd[valid_envs] - yaw[valid_envs]) ** 2).mean().item()
+        #info_hl["train/step"]["energy_per_meter"] = (energy[valid_envs] / distance[valid_envs]).mean().item()
+
+        #info_hl["train/step"]["energy"] = energy[valid_envs].mean().item()
+        # info_hl["train/step"]["distance"] = distance[valid_envs].mean().item()
+
+        info_hl["train/step"]["power_total"] = mean_power[valid_envs].detach().mean().item()
+        #info_hl["train/step"]["CoT"] = self.compute_CoT()[valid_envs].mean().item()
+        info_hl["train/step"]["CoT Dist"] = cot_dist[valid_envs].detach().mean().item()
+        info_hl["train/step"]["CoT Vel"] = cot_vel[valid_envs].detach().mean().item()
+
+        if "train/gait" not in info_hl:
+            info_hl["train/gait"] = {}
+
+        ranges = self.gait_ranges[:, 1] - self.gait_ranges[:, 0]
+        learnable_mask = ranges > 1e-6
+        dgaits_norm = torch.zeros_like(self.dgaits)
+        dgaits_norm[:, learnable_mask] = (self.dgaits[:, learnable_mask] / ranges[learnable_mask])
+        '''for i, name in enumerate(self.gait_param_names):
+            info_hl["train/gait"][name] = self.gaits[:, i].mean().item()
+            # Delta logging ONLY if learnable
+            if learnable_mask[i]:
+                info_hl["train/step"][f"gait_delta_{name}"] = (
+                    dgaits_norm[valid_envs, i].abs().mean().item()
+                )
+        '''
+        # swap offset <-> bound labels ONLY for logging
+        if not self.env.cfg.commands.pacing_offset:
+            label_map = {
+            "offset": "bound",
+            "bound": "offset",
+        }
+        else:
+            label_map = {}
+
+        for i, name in enumerate(self.gait_param_names):
+            log_name = label_map.get(name, name)
+
+            info_hl["train/gait"][log_name] = self.gaits[:, i].detach().mean().item()
+
+            if learnable_mask[i]:
+                info_hl["train/step"][f"gait_delta_{log_name}"] = (
+                    dgaits_norm[valid_envs, i].detach().abs().mean().item()
+                )
+
+        info_hl["train/step"]["gait_delta_mean"] = (
+            dgaits_norm[valid_envs][:, learnable_mask].detach().abs().mean().item()
+        )
+        #info_hl["train/step"]["gait_delta_mean"] = (dgaits_norm[valid_envs][:, learnable_mask].abs().mean().item())
+
+            # info_hl["train/step"][f"gait_delta_{name}"] = (dgaits_norm[valid_envs, i].abs().mean().item())
+
+        # Update last gaits (for ALL)
+        # self.last_gaits[:] = self.gaits.clone()
+
+        # alive_ids = self.alive.nonzero(as_tuple=False).squeeze(-1)
+        # Reset all envs that terminated during the window
+        dead_ids = (~self.alive).nonzero(as_tuple=False).squeeze(-1)
+        if dead_ids.numel() > 0:
+            self.reset_idx(dead_ids)
+            lin_vel_mean[dead_ids] = 0.0
+            ang_vel_mean[dead_ids] = 0.0
+
+        # update last_gaits ONLY for envs that actually executed the HL step
+        executed_mask = valid_counts > 0
+        self.last_gaits[executed_mask] = self.gaits[executed_mask].clone()
+
+        obs = self.get_observations(lin_vel_mean, ang_vel_mean)
+
+        self.global_step += 1
+
+        return obs, reward, done, info_hl
+
+    def _get_gait_ranges(self):
+        gait_cfg = self.cfg.gaits
+        self.gait_param_names = np.array(gait_cfg.name)
+
+        return np.array([
+            gait_cfg.limit_body_height,
+            gait_cfg.limit_gait_frequency,
+            gait_cfg.limit_gait_phase,
+            gait_cfg.limit_gait_offset,
+            gait_cfg.limit_gait_bound,
+            gait_cfg.limit_gait_duration,
+            gait_cfg.limit_footswing_height,
+            gait_cfg.limit_body_pitch,
+            gait_cfg.limit_body_roll,
+            gait_cfg.limit_stance_width,
+            gait_cfg.limit_stance_length,
+            gait_cfg.limit_aux_reward_coef
+        ])
+
+    def set_velocity_commands(self, vel_cmds):
+        assert vel_cmds.shape == self.current_vel_cmds.shape
+        self.current_vel_cmds[:] = vel_cmds
+
+    def _sample_velocity_commands(self, env_ids):
+        # print(f"Fresh velocity sampling is done for the following {env_ids.numel()} envs: {env_ids}")
+        vx = torch.rand(env_ids.numel(), device=self.device) * (
+            self.cfg.commands.lin_vel_x[1]
+            - self.cfg.commands.lin_vel_x[0]
+        ) + self.cfg.commands.lin_vel_x[0]
+
+        vy = torch.rand(env_ids.numel(), device=self.device) * (
+            self.cfg.commands.lin_vel_y[1]
+            - self.cfg.commands.lin_vel_y[0]
+        ) + self.cfg.commands.lin_vel_y[0]
+
+        yaw = torch.rand(env_ids.numel(), device=self.device) * (
+            self.cfg.commands.ang_vel_yaw[1]
+            - self.cfg.commands.ang_vel_yaw[0]
+        ) + self.cfg.commands.ang_vel_yaw[0]
+
+        self.current_vel_cmds[env_ids, :] = torch.stack([vx, vy, yaw], dim=-1)
+
+        # For evaluation
+        # self.current_vel_cmds[env_ids, :] = torch.tensor([[1.0, 0.0, 0.0]], device=self.device)
+
+    def _set_velocity_range(self, stage):
+        if stage == 0:
+            self.cfg.commands.lin_vel_x = [-0.5, -0.5]
+            self.cfg.commands.lin_vel_y = [-0.6, 0.6]
+            self.cfg.commands.ang_vel_yaw = [-1.2, 1.2] #[-0.5, 0.5]
+
+        elif stage == 1:
+            self.cfg.commands.lin_vel_x = [0.0, 1.2]
+            self.cfg.commands.lin_vel_y = [-0.4, 0.4]
+            self.cfg.commands.ang_vel_yaw = [-0.8, 0.8]
+
+        elif stage == 2:
+            self.cfg.commands.lin_vel_x = [-1.5, 1.5]
+            self.cfg.commands.lin_vel_y = [-0.75, 0.75]
+            self.cfg.commands.ang_vel_yaw = [-1.2, 1.2]
+
+        elif stage == 3:
+            self.cfg.commands.lin_vel_x = [0.0, 1.5]
+            self.cfg.commands.lin_vel_y = [-0.6, 0.6]
+            self.cfg.commands.ang_vel_yaw = [-1.0, 1.0]
+
+    def reset(self):
+        self.last_pi2_obs = self.env.reset()
+
+        # Reset HL state
+        self.gaits.zero_()
+        self.last_gaits.zero_()
+        self.pi1_obs_history.zero_()
+
+        # Reset episode integrals
+        for k in self.episode_sums:
+            self.episode_sums[k].zero_()
+
+        # Reset window buffers
+        self.torques_buf.zero_()
+        self.dof_vel_buf.zero_()
+        self.lin_vel_buf.zero_()
+        self.ang_vel_buf.zero_()
+        #self.power_buf.zero_()
+        self.energy_buf.zero_()
+
+        # Sample velocity ONCE per episode
+        #######################################
+        # DISABLE during evaluation
+        self._set_velocity_range(2)
+        print("Stage 2 called!!")
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        self._sample_velocity_commands(env_ids)
+        #########################################
+
+        # For Evaluation ONLY
+        # self.logger = Logger(self.env.dt, self.env.num_envs, self.env.dof_names, self.env.feet_names, self.current_vel_cmds[:, 0].item(), self.current_vel_cmds[:, 2].item(), os.path.join(self.pi1_dir, "plots"), 200, self.env.device)
+
+        # Build initial observations
+        #self._compute_pi1_obs()
+        #self._update_pi1_history()
+        #self._compute_pi1_privileged_obs()
+
+        #return {
+        #    "obs": self.pi1_obss,
+        #    "privileged_obs": self.privileged_pi1_obss,
+        #    "obs_history": self.pi1_obs_history,
+        #}
+
+    # def reset_idx(self, env_ids):
+    #     """
+    #     LL-only reset. Must be invisible to HL.
+    #     """
+    #     if env_ids.numel() == 0:
+    #         return
+    #
+    #     # Reset physics ONLY
+    #     self.env.reset_idx(env_ids)
+    #     self.env.compute_observations()
+    #
+    #     self.alive[env_ids] = True
+    #
+    #     # if self.global_step in [250, 450]:
+    #     #     if self.global_step == 250:
+    #     #         self._set_velocity_range(1)
+    #     #     elif self.global_step == 450:
+    #     #         self._set_velocity_range(2)
+    #     #     env_ids = torch.arange(self.num_envs, device=self.device)
+    #     #     self._sample_velocity_commands(env_ids)
+
+
+    def reset_idx(self, env_ids):
+        """
+        Reset only selected environments.
+        Called when LL terminates inside an HL window.
+        """
+        if env_ids.numel() == 0:
+            return
+
+        # Reset underlying env
+        self.env.reset_idx(env_ids)
+        self.env.compute_observations()
+
+        self.pi1_obs_history[env_ids].zero_()
+        # self.last_gaits[env_ids].zero_()
+
+        # Reset buffers (optional but safe)
+        # self.lin_vel_buf[env_ids].zero_()
+        # self.ang_vel_buf[env_ids].zero_()
+        # self.power_buf[env_ids].zero_()
+        # self.energy_buf[env_ids].zero_()
+
+        # Sample new velocity command for new episode
+        # self._sample_velocity_commands(env_ids)
+        # if self.global_step == 500 * 24: # 1 PPO = 24 HL Steps. 1 HL step = 25 LL steps
+        #     print("Stage 2 called!!")
+        #     self._set_velocity_range(2)
+        self._sample_velocity_commands(env_ids)
+        self.alive[env_ids] = True
+
+    def get_observations(self, lin_vel_mean=None, ang_vel_mean=None):
+        """
+        Called by Runner before rollout.
+        We return the policy 1 obs dict, not policy 2's (i.e. wtw/unio4).
+        """
+        self._compute_pi1_obs(lin_vel_mean, ang_vel_mean)
+        self._update_pi1_history()
+        self._compute_pi1_privileged_obs()
+
+        return {
+            "obs": self.pi1_obss,
+            "privileged_obs": self.privileged_pi1_obss,
+            "obs_history": self.pi1_obs_history,
+        }
+
+
+    def _compute_pi1_obs(self, lin_vel_mean, ang_vel_mean):
+        """
+        Construct policy 1 observation (no history).
+        Here we will use only those features we want Policy 1 to see:
+            - projected gravity vector
+            - base linear (along x and y) and angular vels (yaw)
+            - desired velocity commands (from Runner, not env.commands)
+            - clock inputs (?)
+            - foot contact forces (x, y, z) or resultant foot forces (?)
+            - torques (?)
+            - last gait parameters (?)
+        """
+        self.pi1_obss = torch.empty((self.env.num_envs, 0), dtype=torch.float, device=self.device)
+
+        if lin_vel_mean is None:
+            # Extract xy lin vel, shape [N,2]
+            lin_vel_mean = self.env.base_lin_vel
+
+        if ang_vel_mean is None:
+            # Extract yaw rate ONLY, shape [N,1]
+            ang_vel_mean = self.env.base_ang_vel
+
+        # Current low-level state we choose for gait generator
+        # pi1_features = torch.cat([
+        #     self.env.base_lin_vel,        # [N, 3]
+        #     self.env.base_ang_vel,        # [N, 3]
+        #     self.env.projected_gravity,   # [N, 3]
+        #     self.env.commands[:, :self.cfg.num_commands.num_commands],     # commanded vel
+        #     self.env.contact_forces[:, self.base_env.feet_indices].reshape(N, 12),
+        #     self.env.last_action,
+        #     self.gaits,        # 10
+        #     self.gait_indices.unsqueeze(1),    # phase
+        #     self.clock_inputs,                 # 4
+        # ], dim=-1)
+
+        if self.cfg.env.observe_gravity:
+            self.pi1_obss = torch.cat((self.pi1_obss,
+                                        self.env.projected_gravity), dim=-1)
+
+        if self.cfg.env.observe_command:
+            self.pi1_obss = torch.cat((self.pi1_obss,
+                                        self.current_vel_cmds), dim=-1)
+
+        # if self.cfg.env.observe_timing_parameter:
+        #     self.pi1_obss = torch.cat((self.pi1_obss,
+        #                               self.gait_indices.unsqueeze(1)), dim=-1)
+
+        if self.cfg.env.observe_clock_inputs:
+            self.pi1_obss = torch.cat((self.pi1_obss,
+                                      self.env.clock_inputs), dim=-1) # implement clock inputs here if possible
+
+        if self.cfg.env.observe_vel:
+            if self.cfg.commands.global_reference:
+                self.pi1_obss = torch.cat((self.env.root_states[:self.num_envs, 7:10] * self.cfg.obs_scales.lin_vel,
+                                          self.env.base_ang_vel * self.cfg.obs_scales.ang_vel,
+                                          self.pi1_obss), dim=-1)
+            else:
+                self.pi1_obss = torch.cat((self.env.base_lin_vel * self.cfg.obs_scales.lin_vel,
+                                          self.env.base_ang_vel * self.cfg.obs_scales.ang_vel,
+                                          self.pi1_obss), dim=-1)
+
+        if self.cfg.env.observe_only_ang_vel:
+            self.pi1_obss = torch.cat((self.env.base_ang_vel * self.cfg.obs_scales.ang_vel,
+                                      self.pi1_obss), dim=-1)
+
+        if self.cfg.env.observe_only_lin_vel:
+            self.pi1_obss = torch.cat((self.env.base_lin_vel * self.cfg.obs_scales.lin_vel,
+                                      self.pi1_obss), dim=-1)
+
+        if self.cfg.env.observe_only_lin_vel_xy:
+            #self.pi1_obss = torch.cat((self.env.base_lin_vel[:self.num_envs, :2] * self.cfg.obs_scales.lin_vel,
+            #                          self.pi1_obss), dim=-1)
+            #self.pi1_obss = torch.cat([lin_vel_mean[:, :2] * self.cfg.obs_scales.lin_vel,
+            #                            self.pi1_obss], dim=-1)
+            self.pi1_obss = torch.cat([lin_vel_mean[:self.num_envs, :2] * self.lin_vel_scale, self.pi1_obss], dim=-1)
+
+        if self.cfg.env.observe_only_ang_vel_z:
+            #self.pi1_obss = torch.cat((self.env.base_ang_vel[:self.num_envs, :1] * self.cfg.obs_scales.ang_vel,
+            #                          self.pi1_obss), dim=-1)
+            #self.pi1_obss = torch.cat((ang_vel_mean[:self.num_envs, 2].unsqueeze(1) * self.cfg.obs_scales.ang_vel,
+            #                          self.pi1_obss), dim=-1)
+            self.pi1_obss = torch.cat((ang_vel_mean[:self.num_envs, 2].unsqueeze(1) * self.cfg.obs_scales.ang_vel, self.pi1_obss), dim=-1)
+
+        if self.cfg.env.observe_yaw:
+            forward = quat_apply(self.env.base_quat, self.env.forward_vec)
+            heading = torch.atan2(forward[:, 1], forward[:, 0]).unsqueeze(1)
+            # heading_error = torch.clip(0.5 * wrap_to_pi(heading), -1., 1.).unsqueeze(1)
+            self.pi1_obss = torch.cat((self.pi1_obss,
+                                      heading), dim=-1)
+
+        if self.cfg.env.observe_contact_states:
+            # Include foot forces only (Binary contact)
+            # stance = 1, swing = 0
+            foot_contact = (self.env.contact_forces[:, self.env.feet_indices, 2] > 1.).view(self.env.num_envs, -1) * 1.0
+            self.pi1_obss = torch.cat((self.pi1_obss, foot_contact), dim=1)
+
+        if self.cfg.env.observe_foot_forces:
+            # Extract foot forces
+            foot_forces = self.env.contact_forces[:, self.env.feet_indices, :]  # Shape (num_envs, num_feet, 3)
+            foot_forces_flat = foot_forces.view(self.env.num_envs, -1)      # Flatten: Shape (num_envs, num_feet * 3)
+            self.pi1_obss = torch.cat((self.pi1_obss, foot_forces_flat), dim=1)
+
+        # add noise if needed
+        if self.add_noise:
+            self.pi1_obss += (2 * torch.rand_like(self.pi1_obss) - 1) * self.noise_scale_vec
+
+        assert self.pi1_obss.shape[1] == self.pi1_obs_dim, \
+            f"pi1 obs dim mismatch: got {self.pi1_obss.shape[1]}, expected {self.pi1_obs_dim}"
+
+
+    def _compute_pi1_privileged_obs(self):
+        """
+        Build privileged obs for Policy 1.
+        """
+
+        # build privileged obs
+
+        self.privileged_pi1_obss = torch.empty(self.num_envs, 0).to(self.device)
+        # self.next_privileged_pi1_obss = torch.empty(self.num_envs, 0).to(self.device)
+
+        if self.cfg.env.priv_observe_body_height:
+            body_height_scale, body_height_shift = get_scale_shift(self.cfg.normalization.body_height_range)
+            self.privileged_pi1_obss = torch.cat((self.privileged_pi1_obss,
+                                                 ((self.env.root_states[:self.num_envs, 2]).view(
+                                                     self.num_envs, -1) - body_height_shift) * body_height_scale),
+                                                dim=1)
+
+        if self.cfg.env.priv_observe_friction:
+            friction_coeffs_scale, friction_coeffs_shift = get_scale_shift(self.cfg.normalization.friction_range)
+            self.privileged_pi1_obss = torch.cat((self.privileged_pi1_obss,
+                                                 (self.env.friction_coeffs[:, 0].unsqueeze(1) - friction_coeffs_shift) * friction_coeffs_scale),
+                                                dim=1)
+            # self.next_privileged_pi1_obss = torch.cat((self.next_privileged_pi1_obss,
+            #                                           (self.friction_coeffs[:, 0].unsqueeze(1) - friction_coeffs_shift) * friction_coeffs_scale),
+            #                                          dim=1)
+        # if self.cfg.env.priv_observe_ground_friction:
+        #     self.ground_friction_coeffs = self._get_ground_frictions(range(self.num_envs))
+        #     ground_friction_coeffs_scale, ground_friction_coeffs_shift = get_scale_shift(
+        #         self.cfg.normalization.ground_friction_range)
+        #     self.privileged_pi1_obss = torch.cat((self.privileged_pi1_obss,
+        #                                          (self.env.ground_friction_coeffs.unsqueeze(1) - ground_friction_coeffs_shift) * ground_friction_coeffs_scale),
+        #                                         dim=1)
+        #     self.next_privileged_pi1_obss = torch.cat((self.next_privileged_pi1_obss,
+        #                                               (self.env.ground_friction_coeffs.unsqueeze(1) - friction_coeffs_shift) * friction_coeffs_scale),
+        #                                              dim=1)
+        if self.cfg.env.priv_observe_restitution:
+            restitutions_scale, restitutions_shift = get_scale_shift(self.cfg.normalization.restitution_range)
+            self.privileged_pi1_obss = torch.cat((self.privileged_pi1_obss,
+                                                 (self.env.restitutions[:, 0].unsqueeze(1) - restitutions_shift) * restitutions_scale),
+                                                dim=1)
+            # self.next_privileged_pi1_obss = torch.cat((self.next_privileged_pi1_obss,
+            #                                           (self.env.restitutions[:, 0].unsqueeze(1) - restitutions_shift) * restitutions_scale),
+            #                                          dim=1)
+
+        assert self.privileged_pi1_obss.shape[
+                   1] == self.cfg.env.num_privileged_obs, f"num_privileged_obs ({self.cfg.env.num_privileged_obs}) != the number of privileged observations ({self.privileged_pi1_obss.shape[1]}), you will discard data from the student!"
+
+
+    def _update_pi1_history(self):
+        """
+        Shift history left and append new observations at the end.
+        """
+        self.pi1_obs_history = torch.cat([
+            self.pi1_obs_history[:, self.pi1_obs_dim:],
+            self.pi1_obss
+        ], dim=-1)  # Shape: [num_envs, H * pi1_obs_dim]
+
+
+    def _prepare_reward_function(self):
+        """Prepares a list of reward functions, whcih will be called to
+        compute the total reward.
+        """
+        # Create reward container
+        from aliengo_gym.envs.rewards.corl_rewards import CoRLRewards
+        self.reward_container = CoRLRewards(self)
+
+        # Filter and scale rewards
+        scales = {}
+        for name, scale in self.reward_scales.items():
+            if abs(scale) > 0:
+                # scales[name] = scale * self.dt  # scale by dt
+                scales[name] = scale
+
+        self.reward_scales = scales             # keep only non-zero ones
+
+        # Collect callable reward function
+        self.reward_names = []
+        self.reward_functions = []
+        for name in self.reward_scales.keys():
+
+            fn_name = f"_reward_{name}"
+            fn = getattr(self.reward_container, fn_name, None)
+
+            if fn is not None:
+                self.reward_names.append(name)
+                self.reward_functions.append(fn)
+            else:
+                print(f"[WARNING] Reward '{fn_name}' not found")
+
+        # print(f"reward func name: {self.reward_names}")
+
+        # Episode tracking buffers
+        # self.episode_sums = {
+        #     name: torch.zeros(self.num_envs, device=self.device)
+        #     for name in self.reward_scales
+        # }
+        self.episode_sums["energy"] = torch.zeros(self.num_envs, device=self.device)
+        # self.episode_sums["tracking_lin"] = torch.zeros(self.num_envs, device=self.device)
+        # self.episode_sums["tracking_ang"] = torch.zeros(self.num_envs, device=self.device)
+        self.episode_sums["total"] = torch.zeros(self.num_envs, device=self.device)
+
+    def _compute_reward(self):
+        rew_energy = self._reward_energy_regularization()
+        rew_lin = self._reward_tracking_lin_vel()
+        rew_ang = self._reward_tracking_ang_vel()
+        rew_smooth = self._reward_gait_smooth()
+
+        # reward = rew_energy * (0.7 * rew_lin + 0.3 * rew_ang)
+
+        # tracking = 0.7 * rew_lin + 0.3 * rew_ang
+        # reward = tracking * (0.5 + 0.5 * rew_energy)
+
+        # Regularizers
+        # reward += -0.0003 * self.gaits_change
+        # reward += -0.0010 * torch.mean(
+        #     (self.env.actions - self.env.last_actions)**2, dim=1
+        # )
+
+        reward = rew_energy
+
+        rew_log = torch.log(reward + 1e-6)
+        reward = 3 * (rew_log - rew_log.mean().detach())
+        reward = torch.clamp(reward, -2, 2)
+
+        self.episode_sums["energy"] += rew_energy
+        self.episode_sums["tracking_lin"] += rew_lin
+        self.episode_sums["tracking_ang"] += rew_ang
+        self.episode_sums["total"] += reward
+
+        return reward
+
+    # def _reward_gait_smooth(self):
+    #     ranges = self.gait_ranges[:, 1] - self.gait_ranges[:, 0]
+    #     learnable_mask = ranges > 1e-6
+    #     learnable_names = self.gait_param_names[learnable_mask.cpu().numpy()]
+    #     dgaits_eff = self.dgaits[:, learnable_mask]
+    #     ranges_eff = ranges[learnable_mask]
+
+    #     gaits_norm = dgaits_eff / ranges_eff
+    #     gait_smooth = torch.exp(-(gaits_norm ** 2).sum(dim=-1))
+    #     return gait_smooth, (gaits_norm, learnable_names)
+
+    def _reward_gait_smooth(self):
+        gaits = self.gaits
+        prev_gaits = self.last_gaits
+        ranges = self.gait_ranges[:, 1] - self.gait_ranges[:, 0]
+        dgaits_norm = (gaits - prev_gaits) / (ranges + 1e-6)
+        gait_smooth = torch.exp(-(dgaits_norm ** 2).sum(dim=-1))
+        return gait_smooth
+
+    def _reward_energy_regularization(self, power_total, lin_vel_mean, ang_vel_mean):
+        vel_x = torch.abs(lin_vel_mean[:, 0])
+        ang_z = torch.abs(ang_vel_mean[:, 2])
+
+        denom = (
+            self.cfg.rewards.energy_sigma_lin * vel_x
+            + self.cfg.rewards.energy_sigma_ang * ang_z
+        )
+        return torch.exp(-power_total / (denom + 1e-6))
+
+    def _reward_tracking_lin_vel(self, lin_vel_mean):
+        err = torch.sum(
+            (self.current_vel_cmds[:, :2] - lin_vel_mean[:, :2]) ** 2,
+            dim=1
+        )
+        return torch.exp(-err / self.cfg.rewards.tracking_sigma)
+
+    def _reward_tracking_ang_vel(self, ang_vel_mean):
+        err = (self.current_vel_cmds[:, 2] - ang_vel_mean[:, 2]) ** 2
+        return torch.exp(-err / self.cfg.rewards.tracking_sigma_yaw)
+
+    # def compute_CoT(self):
+    #     # P / (mgv)
+    #     P = torch.sum(torch.multiply(self.env.torques, self.env.dof_vel), dim=1)
+    #     m = 21.5 # (env.default_body_mass + env.payloads).cpu()
+    #     g = 9.81  # m/s^2
+    #     v = torch.norm(self.env.base_lin_vel[:, 0:2], dim=1)
+    #     return self.env.energy_consume / (m * g * v)
+
+    def compute_CoT(self):
+        m = 21.5
+        g = 9.81
+
+        # instantaneous mechanical power (always positive)
+        power = torch.sum(torch.abs(self.env.torques * self.env.dof_vel), dim=1)
+
+        # planar speed
+        v = torch.norm(self.env.base_lin_vel[:, :2], dim=1)
+
+        # avoid division blow-up
+        v = torch.clamp(v, min=0.1)
+
+        cot = power / (m * g * v)
+        return cot
+
+    def _get_noise_scale_vec(self, cfg):
+        """ Sets a vector used to scale the noise added to the observations.
+            [NOTE]: Must be adapted when changing the observations structure
+
+        Args:
+            cfg (Dict): Environment config file
+
+        Returns:
+            [torch.Tensor]: Vector of scales used to multiply a uniform distribution in [-1, 1]
+        """
+        noise_scales = self.cfg.noise_scales
+        noise_level = self.cfg.noise.noise_level
+
+        if self.cfg.env.observe_gravity:
+            noise_vec = torch.ones(3) * noise_scales.gravity * noise_level
+
+        # if self.cfg.env.observe_command:
+        #     noise_vec = torch.cat((torch.ones(3) * noise_scales.gravity * noise_level,
+        #                            torch.zeros(self.cfg.commands.num_commands)), dim=0)
+
+        if self.cfg.env.observe_command:
+            noise_vec = torch.zeros(self.cfg.commands.num_commands)
+
+        # if self.cfg.env.observe_command:
+        #     noise_vec = torch.cat((noise_vec,
+        #                            torch.zeros(self.cfg.commands.num_commands)), dim=0)
+
+        # noise_vec = torch.ones(3) * noise_scales.gravity * noise_level
+
+
+        if self.cfg.env.observe_timing_parameter:
+            noise_vec = torch.cat((noise_vec,
+                                   torch.zeros(1)), dim=0)
+
+        if self.cfg.env.observe_clock_inputs:
+            noise_vec = torch.cat((noise_vec,
+                                   torch.zeros(4)), dim=0)
+
+        if self.cfg.env.observe_vel:
+            noise_vec = torch.cat((torch.ones(3) * noise_scales.lin_vel * noise_level * self.obs_scales.lin_vel,
+                                   torch.ones(3) * noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel), dim=0)
+
+        if self.cfg.env.observe_only_ang_vel:
+            noise_vec = torch.cat((torch.ones(3) * noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel,
+                                   noise_vec), dim=0)
+
+        if self.cfg.env.observe_only_lin_vel:
+            noise_vec = torch.cat((torch.ones(3) * noise_scales.lin_vel * noise_level * self.obs_scales.lin_vel,
+                                   noise_vec), dim=0)
+
+        if self.cfg.env.observe_only_lin_vel_xy:
+            noise_vec = torch.cat((torch.ones(2) * noise_scales.lin_vel * noise_level * self.obs_scales.lin_vel,
+                                   noise_vec), dim=0)
+
+        if self.cfg.env.observe_only_ang_vel_z:
+            noise_vec = torch.cat((torch.ones(1) * noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel,
+                                   noise_vec), dim=0)
+
+        if self.cfg.env.observe_yaw:
+            noise_vec = torch.cat((noise_vec,
+                                   torch.zeros(1)), dim=0)
+
+        if self.cfg.env.observe_contact_states:
+            noise_vec = torch.cat((noise_vec,
+                                   torch.ones(4) * noise_scales.contact_states * noise_level), dim=0)
+
+        if self.cfg.env.observe_foot_forces:
+            noise_vec = torch.cat((noise_vec,
+                                   torch.ones(12) * noise_scales.foot_forces * noise_level), dim=0)
+
+        noise_vec = noise_vec.to(self.device)
+
+        return noise_vec
+
+    def _log_info(self):
+        log_dict = {
+            'command_x': self.env.commands[:, 0].cpu().numpy(),
+            'command_y': self.env.commands[:, 1].cpu().numpy(),
+            'command_yaw': self.env.commands[:, 2].cpu().numpy(),
+        }
+        log_dict['x_vel_cmd'] = self.current_vel_cmds[:, 0].item()
+        log_dict['base_pos_x'] = self.env.base_pos[:, 0].cpu().numpy()
+        log_dict['base_pos_y'] = self.env.base_pos[:, 1].cpu().numpy()
+        log_dict['base_pos_z'] = self.env.base_pos[:, 2].cpu().numpy()
+        log_dict['base_quat_x'] = self.env.base_quat[:, 0].cpu().numpy()
+        log_dict['base_quat_y'] = self.env.base_quat[:, 1].cpu().numpy()
+        log_dict['base_quat_z'] = self.env.base_quat[:, 2].cpu().numpy()
+        log_dict['base_quat_w'] = self.env.base_quat[:, 3].cpu().numpy()
+        log_dict['base_vel_x'] = self.env.base_lin_vel[:, 0].cpu().numpy()
+        log_dict['base_vel_y'] = self.env.base_lin_vel[:, 1].cpu().numpy()
+        log_dict['base_vel_z'] = self.env.base_lin_vel[:, 2].cpu().numpy()
+        log_dict['base_vel_roll'] = self.env.base_ang_vel[:, 0].cpu().numpy()
+        log_dict['base_vel_pitch'] = self.env.base_ang_vel[:, 1].cpu().numpy()
+        log_dict['base_vel_yaw'] = self.env.base_ang_vel[:, 2].cpu().numpy()
+        log_dict['contact_forces_x'] = self.env.contact_forces[:, self.env.feet_indices, 0].cpu().numpy()
+        log_dict['contact_forces_y'] = self.env.contact_forces[:, self.env.feet_indices, 1].cpu().numpy()
+        log_dict['contact_forces_z'] = self.env.contact_forces[:, self.env.feet_indices, 2].cpu().numpy()
+        # LL Reward
+        log_dict['reward'] = self.env.rew_buf[:].detach().clone().cpu().numpy()
+        log_dict['energy_consume'] = self.env.energy_consume[:].cpu().numpy()
+        log_dict['cot'] = self.env.cot[:].cpu().numpy()
+        log_dict['dof_pos'] = self.env.dof_pos.cpu().numpy()[:]
+        log_dict['dof_vel'] = self.env.dof_vel.cpu().numpy()[:]
+        log_dict['dof_acc'] = self.env.dof_acc.cpu().numpy()[:]
+        log_dict['dof_torque'] = self.env.torques.detach().clone().cpu().numpy()[:]
+        log_dict['action_scaled'] = self.env.actions.detach().clone().cpu().numpy()[:] # * env_cfg.control.action_scale
+
+        # Convert quaternion into yaw angle.
+        base_quat_x = self.env.base_quat[:, 0].cpu().numpy()
+        base_quat_y = self.env.base_quat[:, 1].cpu().numpy()
+        base_quat_z = self.env.base_quat[:, 2].cpu().numpy()
+        base_quat_w = self.env.base_quat[:, 3].cpu().numpy()
+
+        rotmat = R.from_quat(np.stack([base_quat_x, base_quat_y, base_quat_z, base_quat_w], axis=1)).as_matrix()
+        headdir = rotmat @ np.array([[1.0], [0.0], [0.0]])
+        log_dict['base_pos_yaw'] = np.arctan2(headdir[:, 1, 0], headdir[:, 0, 0])
+        self.logger.log_states(log_dict)
+
+'''
+class GaitPolicyWrapper(gym.Wrapper):
+    """
+    env action = gait params (from Policy 1)
+    produces torques by calling Policy 2 internally
+    """
+
+    def __init__(self, env, policy2, cfg):
+        super().__init__(env)
+        self.env = env
+        self.wtw = policy2                  # frozen locomotion controller (WTW)
+        self.cfg = cfg
+        self.device = env.device
+        self.enable_curriculum = False      # default
+        self.obs_scales = cfg.obs_scales
+
+        self.num_envs = cfg.env.num_envs
+        self.dt = env.dt
+        self.num_gaits = cfg.env.num_gaits
+
+        self.reward_scales = vars(cfg.reward_scales)
+
+        # allocate buffer for gait params
+        self.gaits = torch.zeros(self.cfg.env.num_envs, self.cfg.env.num_gaits, dtype=torch.float,
+                                device=self.env.device, requires_grad=False)
+        # store last gait params
+        self.last_gaits = torch.zeros_like(self.gaits)
+        self.current_vel_cmds = torch.zeros(self.cfg.env.num_envs, 3, dtype=torch.float, device=self.env.device, requires_grad=False)
+
+        self.pi1_obs_history_length = self.cfg.env.num_observation_history
+        self.pi1_obs_dim = self.cfg.env.num_observations
+        self.num_pi1_obs_history = self.pi1_obs_history_length * self.pi1_obs_dim
+
+        self.last_pi2_obs = None
+
+        # Obs History [num_envs, num_observation_history * pi1_obs_dim]
+        self.pi1_obs_history = torch.zeros(self.env.num_envs, self.num_pi1_obs_history,
+                                        dtype=torch.float, device=self.device, requires_grad=False)
+
+        # Privileged Obs
+        self.num_pi1_privileged_obs = self.cfg.env.num_privileged_obs
+        self.privileged_pi1_obss = torch.zeros(self.env.num_envs, self.num_pi1_privileged_obs,
+                                        dtype=torch.float, device=self.device, requires_grad=False)
+
+        # Noise
+        #self.noise_scale_vec = self._get_noise_scale_vec(cfg)
+        self.add_noise = self.cfg.noise.add_noise
+        self.lin_vel_scale = torch.tensor([self.cfg.obs_scales.lin_vel,          # vx scale
+                                        2.0 * self.cfg.obs_scales.lin_vel],      # vy scale
+                                        device=self.device
+        )
+        wtw_freq = 1.0 / env.dt        # env.dt = env.sim_params.dt * env.cfg.control.decimation
+        policy1_freq = 2
+        self.hl_decimation = max(1, int(round(wtw_freq / policy1_freq)))
+
+        self.win_len = self.hl_decimation
+        self.torques_buf = torch.zeros(self.num_envs, self.win_len, 12, device=self.device)
+        self.dof_vel_buf = torch.zeros(self.num_envs, self.win_len, 12, device=self.device)
+        self.lin_vel_buf = torch.zeros(self.num_envs, self.win_len, 3, device=self.device)
+        self.ang_vel_buf = torch.zeros(self.num_envs, self.win_len, 3, device=self.device)
+        self.dof_vel_buf = torch.zeros(self.num_envs, self.win_len, 12, device=self.device)
+        #self.power_buf   = torch.zeros(self.num_envs, self.win_len, device=self.device)
+        self.energy_buf   = torch.zeros(self.num_envs, self.win_len, device=self.device)
+        self.alive = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        #self.rew_ll_buf = torch.zeros(self.num_envs, self.win_len, device=self.device) # (num_envs, win_len)
+
+        self.gait_ranges = torch.tensor(self._get_gait_ranges(), dtype=torch.float32, device=self.device)
+        #print(f"gait ranges: {self.gait_ranges}")
+
+        # self._prepare_reward_function()
+
+        self.global_step = 0
+
+        self.episode_sums = {
+            "energy": torch.zeros(self.num_envs, device=self.device),
+            "gait_smoothness": torch.zeros(self.num_envs, device=self.device),
+            "tracking": torch.zeros(self.num_envs, device=self.device),
+            "rew_ll": torch.zeros(self.num_envs, device=self.device),
+            # "tracking_lin": torch.zeros(self.num_envs, device=self.device),
+            # "tracking_ang": torch.zeros(self.num_envs, device=self.device),
+            "total_reward": torch.zeros(self.num_envs, device=self.device),
+        }
+        # FOR  EVALUATION ONLY
+        self.pi1_dir = "/home/anubhav1772/Documents/code/WTW-Aliengo/runs/gait-conditioned-agility/2026-01-07/train_gait_generator/165511.866441"
+
+    def step(self, gaits):
+        """
+        gaits: Policy 1 actions, shape [num_envs, num_gaits]
+        """
+        if self.global_step == 300 * 24: # 1 PPO = 24 HL Steps. 1 HL step = 25 LL steps
+            print("Stage 1 called!!")
+            self._set_velocity_range(1)
+            env_ids = torch.arange(self.num_envs, device=self.device)
+            self._sample_velocity_commands(env_ids)
+
+        elif self.global_step == 450 * 24:
+            print("Stage 2 called")
+            self._set_velocity_range(2)
+            env_ids = torch.arange(self.num_envs, device=self.device)
+            self._sample_velocity_commands(env_ids)
+
+        distance = torch.zeros(self.num_envs, device=self.device)
+        distance_masked = torch.zeros(self.num_envs, device=self.device)
+        done = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        #alive = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        valid_counts = torch.zeros(self.num_envs, device=self.device)
+        rew_accum = torch.zeros(self.num_envs, device=self.device)
+
+        info_hl = {}
+
+        self.lin_vel_buf.zero_()
+        self.ang_vel_buf.zero_()
+        #self.power_buf.zero_()
+        self.energy_buf.zero_()
+        self.dof_vel_buf.zero_()
+        self.torques_buf.zero_()
+        #self.rew_ll_buf.zero_()
+
+        self.gaits[:] = gaits
+        self.dgaits = self.gaits - self.last_gaits
+
+        # Inject velocity commands + generated gaits into underlying env for Policy 2
+        alive_ids = self.alive.nonzero(as_tuple=False).squeeze(-1)
+        # self.wtw.set_env_commands(vel_cmds=self.current_vel_cmds, gait_params=self.gaits, env_ids=alive_ids)
+        # gaits (HL actions)
+        self.env.commands[alive_ids, :3] = self.current_vel_cmds[alive_ids]
+        # velocities (task command)
+        self.env.commands[:, 3:3 + self.gaits.shape[1]] = self.gaits
+
+        # print(f"cmd vel: {self.current_vel_cmds} gaits: {self.gaits}")
+
+        for i in range(self.win_len):
+            if not self.alive.any():
+                break
+            alive_pre_step = self.alive.clone()
+            with torch.no_grad():
+                action_pi2 = self.wtw.policy(self.last_pi2_obs)
+
+            obs_pi2_next, rew_pi2, done_step, info = self.env.step(action_pi2)
+            self.last_pi2_obs = obs_pi2_next
+
+            self._log_info()
+
+            done_step = done_step.bool()
+            # Count this LL step if env was alive at step start
+            valid_counts[alive_pre_step] += 1
+
+            # physics truth
+            lin_vels = self.env.base_lin_vel
+            ang_vels = self.env.base_ang_vel
+            dof_vels = self.env.dof_vel
+            torques = self.env.torques
+
+            mask = self.alive[:, None]
+
+            self.lin_vel_buf[:, i, :] = lin_vels * mask
+            self.ang_vel_buf[:, i, :] = ang_vels * mask
+            self.torques_buf[:, i, :] = torques * mask
+            self.dof_vel_buf[:, i, :] = dof_vels * mask
+
+            # LL reward (window-normalized)
+            rew_accum += 25.0 * rew_pi2 * self.alive.float() / self.win_len
+
+            # power
+            #power_step = torch.sum(torch.abs(self.env.torques * self.env.dof_vel), dim=1)  # shape: [num_envs]
+            #self.power_buf[:, i] = power_step * mask.squeeze(1)
+            energy_step = torch.sum(torch.abs(self.env.torques * self.env.dof_vel), dim=1) * self.dt
+            self.energy_buf[:, i] = energy_step * self.alive.float()
+
+            distance_masked[self.alive] += (torch.norm(self.lin_vel_buf[self.alive, i, :2], dim=1) * self.dt)
+
+            # Update alive mask
+            newly_done = done_step & self.alive
+            done = done | newly_done
+            self.alive &= ~newly_done
+
+        valid_counts = torch.clamp(valid_counts, min=1.0)
+
+        # Means only for logging / obs
+        lin_vel_mean = self.lin_vel_buf.mean(dim=1)
+        ang_vel_mean = self.ang_vel_buf.mean(dim=1)
+        reward_ll = rew_accum
+
+        #power_total = self.power_buf.sum(dim=1)
+        power_total = torch.sum(torch.abs(self.torques_buf * self.dof_vel_buf),dim=(1, 2))
+        mean_power = power_total / valid_counts
+        #mean_power = power_total / self.win_len                       # J
+        energy = self.energy_buf.sum(dim=1)
+
+        distance = torch.clamp(distance_masked, min=1e-3)
+        cot = energy / (self.cfg.env.mg * distance)
+        # For Evaluation ONLY
+        if "test/step" not in info_hl:
+            info_hl["test/step"] = {}
+
+        info_hl["test/step"]["cot"] = cot.item()
+
+        rew_smooth  = self._reward_gait_smooth()
+        rew_energy = self._reward_energy_regularization(power_total, lin_vel_mean, ang_vel_mean)
+        reward_hl = rew_energy + 0.2 * rew_smooth
+        #rew_energy = torch.exp(-cot)
+
+        mask = self.alive.float()
+
+        reward_hl *= mask
+        # neutralize dead envs WITHOUT zeros
+        #rew_total = torch.where(self.alive, rew_total, torch.ones_like(rew_total))
+        # enforce positivity
+        #rew_total = torch.clamp(rew_total, min=1e-6)
+        #rew_log = torch.log(reward_ll + reward_hl)
+        rew_log = torch.log(reward_ll + reward_hl)
+        reward = 3.0 * (rew_log - rew_log.mean().detach())
+        reward = torch.clamp(reward, -2.0, 2.0)
+        #reward = rew_total * mask
+
+        vx_cmd = self.current_vel_cmds[:, 0]
+        vy_cmd = self.current_vel_cmds[:, 1]
+        yaw_cmd = self.current_vel_cmds[:, 2]
+        #vx_cmd, vy_cmd, yaw_cmd = self.current_vel_cmds.T
+
+        vx = lin_vel_mean[:, 0]
+        vy = lin_vel_mean[:, 1]
+        #vx, vy, _ = lin_vel_mean.T
+        yaw = ang_vel_mean[:, 2]
+
+        # Episode sums
+        self.episode_sums["energy"] += rew_energy * mask
+        self.episode_sums["gait_smoothness"] += rew_smooth * mask
+        self.episode_sums["rew_ll"] += reward_ll * mask
+        # self.episode_sums["tracking_lin"] += rew_lin * mask
+        # self.episode_sums["tracking_ang"] += rew_ang * mask
+        self.episode_sums["total_reward"] += reward * mask # doesn't make sense because of log
+
+        if done.any():
+
+            info_hl["train/episode"] = {}
+
+            done_ids = done.nonzero(as_tuple=False).squeeze(-1)
+
+            # Total accumulated energy over the whole episode
+            # Only for envs that just finished
+            info_hl["train/episode"]["rew_energy"] = (
+                self.episode_sums["energy"][done_ids].mean().item()
+            )
+            info_hl["train/episode"]["rew_total"] = (
+                self.episode_sums["total_reward"][done_ids].mean().item()
+            )
+            info_hl["train/episode"]["rew_gait_smoothness"] = (
+                self.episode_sums["gait_smoothness"][done_ids].mean().item()
+            )
+            info_hl["train/episode"]["rew_ll"] = (
+                self.episode_sums["rew_ll"][done_ids].mean().item()
+            )
+            # info_hl["train/episode"]["rew_tracking_lin"] = (
+            #     self.episode_sums["tracking_lin"][done_ids].mean().item()
+            # )
+            # info_hl["train/episode"]["rew_tracking_ang"] = (
+            #     self.episode_sums["tracking_ang"][done_ids].mean().item()
+            # )
+            # reset per-env episode sums
+            for k in self.episode_sums:
+                self.episode_sums[k][done_ids] = 0.0
+
+        if "train/step" not in info_hl:
+            info_hl["train/step"] = {}
+
+        info_hl["train/step"]["valid_counts_mean"] = valid_counts.mean().item()
+        info_hl["train/step"]["valid_counts_min"]  = valid_counts.min().item()
+        info_hl["train/step"]["valid_counts_max"]  = valid_counts.max().item()
+
+        valid_envs = valid_counts > 0
+
+        #self.episode_sums["rew_ll"][valid_envs] += (rew_ll_win[valid_envs] / valid_counts[valid_envs])
+        # Step-wise metrics
+        info_hl["train/step"]["rew_energy"] = rew_energy[valid_envs].mean().item()
+        info_hl["train/step"]["rew_smooth"] = rew_smooth[valid_envs].mean().item()
+        info_hl["train/step"]["rew_ll_mean"] = reward_ll[valid_envs].mean().item()
+        info_hl['train/step']["rew_ll_min"] = reward_ll[valid_envs].min().item()
+        info_hl['train/step']["rew_ll_max"] = reward_ll[valid_envs].max().item()
+        # info_hl["train/step"]["rew_tracking_lin"] = rew_lin[valid_envs].mean().item()
+        # info_hl["train/step"]["rew_tracking_ang"] = rew_ang[valid_envs].mean().item()
+        info_hl["train/step"]["rew_mean"] = reward[valid_envs].mean().item()
+        info_hl["train/step"]["rew_min"] = reward[valid_envs].min().item()
+        info_hl["train/step"]["rew_max"] = reward[valid_envs].max().item()
+
+        info_hl["train/step"]["vx_cmd_abs"] = vx_cmd[valid_envs].abs().mean().item()
+        info_hl["train/step"]["vx_abs"] = vx[valid_envs].abs().mean().item()
+        #info_hl["train/step"]["vx_ratio"] = ((vx.abs() / (vx_cmd.abs() + 1e-6))[valid_envs].mean().item())
+        cmd_mask = (vx_cmd.abs() > 0.1) & valid_envs
+        if cmd_mask.any():
+            info_hl["train/step"]["vx_ratio"] = (
+                (vx.abs() / vx_cmd.abs())[cmd_mask].mean().item()
+            )
+        else:
+            info_hl["train/step"]["vx_ratio"] = 0.0
+        # info_hl["train/step"]["vx_err"] = ((vx_cmd[valid_envs] - vx[valid_envs]) ** 2).mean().item()
+        info_hl["train/step"]["vx_err"] = (vx_cmd[valid_envs] - vx[valid_envs]).abs().mean().item()
+
+        # info_hl["train/step"]["yaw_cmd_abs"] = yaw_cmd[valid_envs].abs().mean().item()
+        # info_hl["train/step"]["yaw_abs"] = yaw[valid_envs].abs().mean().item()
+        # info_hl["train/step"]["yaw_err"] = ((yaw_cmd[valid_envs] - yaw[valid_envs]) ** 2).mean().item()
+        #info_hl["train/step"]["energy_per_meter"] = (energy[valid_envs] / distance[valid_envs]).mean().item()
+
+        #info_hl["train/step"]["energy"] = energy[valid_envs].mean().item()
+        # info_hl["train/step"]["distance"] = distance[valid_envs].mean().item()
+
+        info_hl["train/step"]["power_total"] = mean_power[valid_envs].mean().item()
+        #info_hl["train/step"]["CoT"] = self.compute_CoT()[valid_envs].mean().item()
+        info_hl["train/step"]["CoT"] = cot[valid_envs].mean().item()
+
+        if "train/gait" not in info_hl:
+            info_hl["train/gait"] = {}
+
+        ranges = self.gait_ranges[:, 1] - self.gait_ranges[:, 0]
+        learnable_mask = ranges > 1e-6
+        dgaits_norm = torch.zeros_like(self.dgaits)
+        dgaits_norm[:, learnable_mask] = (self.dgaits[:, learnable_mask] / ranges[learnable_mask])
+        for i, name in enumerate(self.gait_param_names):
+            info_hl["train/gait"][name] = self.gaits[:, i].mean().item()
+            # Delta logging ONLY if learnable
+            if learnable_mask[i]:
+                info_hl["train/step"][f"gait_delta_{name}"] = (
+                    dgaits_norm[valid_envs, i].abs().mean().item()
+                )
+
+        info_hl["train/step"]["gait_delta_mean"] = (dgaits_norm[valid_envs][:, learnable_mask].abs().mean().item())
+
+        # Update last gaits (for ALL)
+        self.last_gaits[:] = self.gaits
+
+        # alive_ids = self.alive.nonzero(as_tuple=False).squeeze(-1)
+        # Reset all envs that terminated during the window
+        dead_ids = (~self.alive).nonzero(as_tuple=False).squeeze(-1)
+        if dead_ids.numel() > 0:
+            self.reset_idx(dead_ids)
+            lin_vel_mean[dead_ids] = 0.0
+            ang_vel_mean[dead_ids] = 0.0
+
+        obs = self.get_observations(lin_vel_mean, ang_vel_mean)
+
+        self.global_step += 1
+
+        return obs, reward, done, info_hl
+
+    def _get_gait_ranges(self):
+        gait_cfg = self.cfg.gaits
+        self.gait_param_names = np.array(gait_cfg.name)
+
+        return np.array([
+            gait_cfg.limit_body_height,
+            gait_cfg.limit_gait_frequency,
+            gait_cfg.limit_gait_phase,
+            gait_cfg.limit_gait_offset,
+            gait_cfg.limit_gait_bound,
+            gait_cfg.limit_gait_duration,
+            gait_cfg.limit_footswing_height,
+            gait_cfg.limit_body_pitch,
+            gait_cfg.limit_body_roll,
+            gait_cfg.limit_stance_width,
+            gait_cfg.limit_stance_length
+        ])
+
+    def set_velocity_commands(self, vel_cmds):
+        assert vel_cmds.shape == self.current_vel_cmds.shape
+        self.current_vel_cmds[:] = vel_cmds
+
+    def _sample_velocity_commands(self, env_ids):
+        vx = torch.rand(env_ids.numel(), device=self.device) * (
+            self.cfg.commands.lin_vel_x[1]
+            - self.cfg.commands.lin_vel_x[0]
+        ) + self.cfg.commands.lin_vel_x[0]
+
+        vy = torch.rand(env_ids.numel(), device=self.device) * (
+            self.cfg.commands.lin_vel_y[1]
+            - self.cfg.commands.lin_vel_y[0]
+        ) + self.cfg.commands.lin_vel_y[0]
+
+        yaw = torch.rand(env_ids.numel(), device=self.device) * (
+            self.cfg.commands.ang_vel_yaw[1]
+            - self.cfg.commands.ang_vel_yaw[0]
+        ) + self.cfg.commands.ang_vel_yaw[0]
+
+        self.current_vel_cmds[env_ids, :] = torch.stack([vx, vy, yaw], dim=-1)
+
+        # For evaluation
+        # self.current_vel_cmds[env_ids, :] = torch.tensor([[1.0, 0.0, 0.0]], device=self.device)
+
+    def _set_velocity_range(self, stage):
+        if stage == 0:
+            self.cfg.commands.lin_vel_x = [0.0, 0.6]
+            self.cfg.commands.lin_vel_y = [-0.2, 0.2]
+            self.cfg.commands.ang_vel_yaw = [-0.5, 0.5]
+
+        elif stage == 1:
+            self.cfg.commands.lin_vel_x = [0.0, 1.2]
+            self.cfg.commands.lin_vel_y = [-0.4, 0.4]
+            self.cfg.commands.ang_vel_yaw = [-0.8, 0.8]
+
+        elif stage == 2:
+            self.cfg.commands.lin_vel_x = [-1.5, 1.5]
+            self.cfg.commands.lin_vel_y = [-0.75, 0.75]
+            self.cfg.commands.ang_vel_yaw = [-1.2, 1.2]
+
+    def reset(self):
+        self.last_pi2_obs = self.env.reset()
+
+        self.global_step = 0
+        self.alive[:] = True
+
+        # Reset HL state
+        self.gaits.zero_()
+        self.last_gaits.zero_()
+        self.pi1_obs_history.zero_()
+
+        # Reset episode integrals
+        for k in self.episode_sums:
+            self.episode_sums[k].zero_()
+
+        # Reset window buffers
+        self.torques_buf.zero_()
+        self.dof_vel_buf.zero_()
+        self.lin_vel_buf.zero_()
+        self.ang_vel_buf.zero_()
+        #self.power_buf.zero_()
+        self.energy_buf.zero_()
+
+        # COMMENT THESE DURING EVALUATION
+        # Sample velocity ONCE per episode
+        #self._set_velocity_range(0)
+        #print("Stage 0 called!!")
+        #env_ids = torch.arange(self.num_envs, device=self.device)
+        #self._sample_velocity_commands(env_ids)
+
+        # For Evaluation ONLY
+        self.logger = Logger(self.env.dt, self.env.num_envs, self.env.dof_names, self.env.feet_names, self.current_vel_cmds[:, 0].item(), self.current_vel_cmds[:, 2].item(), os.path.join(self.pi1_dir, "plots"), 200, self.env.device)
+
+        # Build initial observations
+        self._compute_pi1_obs()
+        self._update_pi1_history()
+        self._compute_pi1_privileged_obs()
+
+        return {
+            "obs": self.pi1_obss,
+            "privileged_obs": self.privileged_pi1_obss,
+            "obs_history": self.pi1_obs_history,
+        }
+
+    def reset_idx(self, env_ids):
+        """
+        LL-only reset. Must be invisible to HL.
+        """
+        if env_ids.numel() == 0:
+            return
+
+        # Reset physics ONLY
+        self.env.reset_idx(env_ids)
+        self.env.compute_observations()
+
+        self.alive[env_ids] = True
+
+        # if self.global_step in [250, 450]:
+        #     if self.global_step == 250:
+        #         self._set_velocity_range(1)
+        #     elif self.global_step == 450:
+        #         self._set_velocity_range(2)
+        #     env_ids = torch.arange(self.num_envs, device=self.device)
+        #     self._sample_velocity_commands(env_ids)
+
+
+    # def reset_idx(self, env_ids):
+    #     """
+    #     Reset only selected environments.
+    #     Called when LL terminates inside an HL window.
+    #     """
+    #     if env_ids.numel() == 0:
+    #         return
+    #
+    #     # Reset underlying env
+    #     self.env.reset_idx(env_ids)
+    #     self.env.compute_observations()
+    #
+    #     self.pi1_obs_history[env_ids].zero_()
+    #     self.last_gaits[env_ids].zero_()
+    #
+    #     # Reset buffers (optional but safe)
+    #     self.lin_vel_buf[env_ids].zero_()
+    #     self.ang_vel_buf[env_ids].zero_()
+    #     self.power_buf[env_ids].zero_()
+    #     self.energy_buf[env_ids].zero_()
+    #
+    #     # Sample new velocity command for new episode
+    #     self._sample_velocity_commands(env_ids)
+    #     self.alive[env_ids] = True
+
+    def get_observations(self, lin_vel_mean, ang_vel_mean):
+        """
+        Called by Runner before rollout.
+        We return the policy 1 obs dict, not policy 2's (i.e. wtw/unio4).
+        """
+        self._compute_pi1_obs(lin_vel_mean, ang_vel_mean)
+        self._update_pi1_history()
+        self._compute_pi1_privileged_obs()
+
+        if not torch.isfinite(self.pi1_obs_history).all():
+            raise RuntimeError("NaNs detected in Policy-1 observation history")
+
+        return {
+            "obs": self.pi1_obss,
+            "privileged_obs": self.privileged_pi1_obss,
+            "obs_history": self.pi1_obs_history,
+        }
+
+
+    def _compute_pi1_obs(self, lin_vel_mean=None, ang_vel_mean=None):
+        """
+        Construct policy 1 observation (no history).
+        Here we will use only those features we want Policy 1 to see:
+            - projected gravity vector
+            - base linear (along x and y) and angular vels (yaw)
+            - desired velocity commands (from Runner, not env.commands)
+            - clock inputs (?)
+            - foot contact forces (x, y, z) or resultant foot forces (?)
+            - torques (?)
+            - last gait parameters (?)
+        """
+        self.pi1_obss = torch.empty((self.env.num_envs, 0), dtype=torch.float, device=self.device)
+
+        if lin_vel_mean is None:
+            lin_vel_mean = self.env.base_lin_vel
+
+        if ang_vel_mean is None:
+            ang_vel_mean = self.env.base_ang_vel
+
+        # Current low-level state we choose for gait generator
+        # pi1_features = torch.cat([
+        #     self.env.base_lin_vel,        # [N, 3]
+        #     self.env.base_ang_vel,        # [N, 3]
+        #     self.env.projected_gravity,   # [N, 3]
+        #     self.env.commands[:, :self.cfg.num_commands.num_commands],     # commanded vel
+        #     self.env.contact_forces[:, self.base_env.feet_indices].reshape(N, 12),
+        #     self.env.last_action,
+        #     self.gaits,        # 10
+        #     self.gait_indices.unsqueeze(1),    # phase
+        #     self.clock_inputs,                 # 4
+        # ], dim=-1)
+
+        if self.cfg.env.observe_gravity:
+            self.pi1_obss = torch.cat((self.pi1_obss,
+                                        self.env.projected_gravity), dim=-1)
+
+        if self.cfg.env.observe_command:
+            self.pi1_obss = torch.cat((self.pi1_obss,
+                                        self.current_vel_cmds), dim=-1)
+
+        # if self.cfg.env.observe_timing_parameter:
+        #     self.pi1_obss = torch.cat((self.pi1_obss,
+        #                               self.gait_indices.unsqueeze(1)), dim=-1)
+
+        if self.cfg.env.observe_clock_inputs:
+            self.pi1_obss = torch.cat((self.pi1_obss,
+                                      self.env.clock_inputs), dim=-1) # implement clock inputs here if possible
+
+        if self.cfg.env.observe_vel:
+            if self.cfg.commands.global_reference:
+                self.pi1_obss = torch.cat((self.env.root_states[:self.num_envs, 7:10] * self.cfg.obs_scales.lin_vel,
+                                          self.env.base_ang_vel * self.cfg.obs_scales.ang_vel,
+                                          self.pi1_obss), dim=-1)
+            else:
+                self.pi1_obss = torch.cat((self.env.base_lin_vel * self.cfg.obs_scales.lin_vel,
+                                          self.env.base_ang_vel * self.cfg.obs_scales.ang_vel,
+                                          self.pi1_obss), dim=-1)
+
+        if self.cfg.env.observe_only_ang_vel:
+            self.pi1_obss = torch.cat((self.env.base_ang_vel * self.cfg.obs_scales.ang_vel,
+                                      self.pi1_obss), dim=-1)
+
+        if self.cfg.env.observe_only_lin_vel:
+            self.pi1_obss = torch.cat((self.env.base_lin_vel * self.cfg.obs_scales.lin_vel,
+                                      self.pi1_obss), dim=-1)
+
+        if self.cfg.env.observe_only_lin_vel_xy:
+            #self.pi1_obss = torch.cat((self.env.base_lin_vel[:self.num_envs, :2] * self.cfg.obs_scales.lin_vel,
+            #                          self.pi1_obss), dim=-1)
+            #self.pi1_obss = torch.cat([lin_vel_mean[:, :2] * self.cfg.obs_scales.lin_vel,
+            #                            self.pi1_obss], dim=-1)
+            self.pi1_obss = torch.cat([lin_vel_mean[:, :2] * self.lin_vel_scale, self.pi1_obss], dim=-1)
+
+        if self.cfg.env.observe_only_ang_vel_z:
+            #self.pi1_obss = torch.cat((self.env.base_ang_vel[:self.num_envs, :1] * self.cfg.obs_scales.ang_vel,
+            #                          self.pi1_obss), dim=-1)
+            self.pi1_obss = torch.cat((ang_vel_mean[:self.num_envs, 2].unsqueeze(1) * self.cfg.obs_scales.ang_vel,
+                                      self.pi1_obss), dim=-1)
+
+        if self.cfg.env.observe_yaw:
+            forward = quat_apply(self.env.base_quat, self.env.forward_vec)
+            heading = torch.atan2(forward[:, 1], forward[:, 0]).unsqueeze(1)
+            # heading_error = torch.clip(0.5 * wrap_to_pi(heading), -1., 1.).unsqueeze(1)
+            self.pi1_obss = torch.cat((self.pi1_obss,
+                                      heading), dim=-1)
+
+        if self.cfg.env.observe_contact_states:
+            # Include foot forces only (Binary contact)
+            # stance = 1, swing = 0
+            foot_contact = (self.env.contact_forces[:, self.env.feet_indices, 2] > 1.).view(self.env.num_envs, -1) * 1.0
+            self.pi1_obss = torch.cat((self.pi1_obss, foot_contact), dim=1)
+
+        if self.cfg.env.observe_foot_forces:
+            # Extract foot forces
+            foot_forces = self.env.contact_forces[:, self.env.feet_indices, :]  # Shape (num_envs, num_feet, 3)
+            foot_forces_flat = foot_forces.view(self.env.num_envs, -1)      # Flatten: Shape (num_envs, num_feet * 3)
+            self.pi1_obss = torch.cat((self.pi1_obss, foot_forces_flat), dim=1)
+
+        # add noise if needed
+        if self.add_noise:
+            self.pi1_obss += (2 * torch.rand_like(self.pi1_obss) - 1) * self.noise_scale_vec
+
+        assert self.pi1_obss.shape[1] == self.pi1_obs_dim, \
+            f"pi1 obs dim mismatch: got {self.pi1_obss.shape[1]}, expected {self.pi1_obs_dim}"
+
+
+    def _compute_pi1_privileged_obs(self):
+        """
+        Build privileged obs for Policy 1.
+        """
+
+        # build privileged obs
+
+        self.privileged_pi1_obss = torch.empty(self.num_envs, 0).to(self.device)
+        # self.next_privileged_pi1_obss = torch.empty(self.num_envs, 0).to(self.device)
+
+        if self.cfg.env.priv_observe_body_height:
+            body_height_scale, body_height_shift = get_scale_shift(self.cfg.normalization.body_height_range)
+            self.privileged_pi1_obss = torch.cat((self.privileged_pi1_obss,
+                                                 ((self.env.root_states[:self.num_envs, 2]).view(
+                                                     self.num_envs, -1) - body_height_shift) * body_height_scale),
+                                                dim=1)
+
+        if self.cfg.env.priv_observe_friction:
+            friction_coeffs_scale, friction_coeffs_shift = get_scale_shift(self.cfg.normalization.friction_range)
+            self.privileged_pi1_obss = torch.cat((self.privileged_pi1_obss,
+                                                 (self.env.friction_coeffs[:, 0].unsqueeze(1) - friction_coeffs_shift) * friction_coeffs_scale),
+                                                dim=1)
+            # self.next_privileged_pi1_obss = torch.cat((self.next_privileged_pi1_obss,
+            #                                           (self.friction_coeffs[:, 0].unsqueeze(1) - friction_coeffs_shift) * friction_coeffs_scale),
+            #                                          dim=1)
+        # if self.cfg.env.priv_observe_ground_friction:
+        #     self.ground_friction_coeffs = self._get_ground_frictions(range(self.num_envs))
+        #     ground_friction_coeffs_scale, ground_friction_coeffs_shift = get_scale_shift(
+        #         self.cfg.normalization.ground_friction_range)
+        #     self.privileged_pi1_obss = torch.cat((self.privileged_pi1_obss,
+        #                                          (self.env.ground_friction_coeffs.unsqueeze(1) - ground_friction_coeffs_shift) * ground_friction_coeffs_scale),
+        #                                         dim=1)
+        #     self.next_privileged_pi1_obss = torch.cat((self.next_privileged_pi1_obss,
+        #                                               (self.env.ground_friction_coeffs.unsqueeze(1) - friction_coeffs_shift) * friction_coeffs_scale),
+        #                                              dim=1)
+        if self.cfg.env.priv_observe_restitution:
+            restitutions_scale, restitutions_shift = get_scale_shift(self.cfg.normalization.restitution_range)
+            self.privileged_pi1_obss = torch.cat((self.privileged_pi1_obss,
+                                                 (self.env.restitutions[:, 0].unsqueeze(1) - restitutions_shift) * restitutions_scale),
+                                                dim=1)
+            # self.next_privileged_pi1_obss = torch.cat((self.next_privileged_pi1_obss,
+            #                                           (self.env.restitutions[:, 0].unsqueeze(1) - restitutions_shift) * restitutions_scale),
+            #                                          dim=1)
+
+        assert self.privileged_pi1_obss.shape[
+                   1] == self.cfg.env.num_privileged_obs, f"num_privileged_obs ({self.cfg.env.num_privileged_obs}) != the number of privileged observations ({self.privileged_pi1_obss.shape[1]}), you will discard data from the student!"
+
+
+    def _update_pi1_history(self):
+        """
+        Shift history left and append new observations at the end.
+        """
+        self.pi1_obs_history = torch.cat([
+            self.pi1_obs_history[:, self.pi1_obs_dim:],
+            self.pi1_obss
+        ], dim=-1)  # Shape: [num_envs, H * pi1_obs_dim]
+
+
+    def _prepare_reward_function(self):
+        """Prepares a list of reward functions, whcih will be called to
+        compute the total reward.
+        """
+        # Create reward container
+        from aliengo_gym.envs.rewards.corl_rewards import CoRLRewards
+        self.reward_container = CoRLRewards(self)
+
+        # Filter and scale rewards
+        scales = {}
+        for name, scale in self.reward_scales.items():
+            if abs(scale) > 0:
+                # scales[name] = scale * self.dt  # scale by dt
+                scales[name] = scale
+
+        self.reward_scales = scales             # keep only non-zero ones
+
+        # Collect callable reward function
+        self.reward_names = []
+        self.reward_functions = []
+        for name in self.reward_scales.keys():
+
+            fn_name = f"_reward_{name}"
+            fn = getattr(self.reward_container, fn_name, None)
+
+            if fn is not None:
+                self.reward_names.append(name)
+                self.reward_functions.append(fn)
+            else:
+                print(f"[WARNING] Reward '{fn_name}' not found")
+
+        # print(f"reward func name: {self.reward_names}")
+
+        # Episode tracking buffers
+        # self.episode_sums = {
+        #     name: torch.zeros(self.num_envs, device=self.device)
+        #     for name in self.reward_scales
+        # }
+        self.episode_sums["energy"] = torch.zeros(self.num_envs, device=self.device)
+        # self.episode_sums["tracking_lin"] = torch.zeros(self.num_envs, device=self.device)
+        # self.episode_sums["tracking_ang"] = torch.zeros(self.num_envs, device=self.device)
+        self.episode_sums["total"] = torch.zeros(self.num_envs, device=self.device)
+
+    def _compute_reward(self):
+        rew_energy = self._reward_energy_regularization()
+        rew_lin = self._reward_tracking_lin_vel()
+        rew_ang = self._reward_tracking_ang_vel()
+        rew_smooth = self._reward_gait_smooth()
+
+        # reward = rew_energy * (0.7 * rew_lin + 0.3 * rew_ang)
+
+        # tracking = 0.7 * rew_lin + 0.3 * rew_ang
+        # reward = tracking * (0.5 + 0.5 * rew_energy)
+
+        # Regularizers
+        # reward += -0.0003 * self.gaits_change
+        # reward += -0.0010 * torch.mean(
+        #     (self.env.actions - self.env.last_actions)**2, dim=1
+        # )
+
+        reward = rew_energy
+
+        rew_log = torch.log(reward + 1e-6)
+        reward = 3 * (rew_log - rew_log.mean().detach())
+        reward = torch.clamp(reward, -2, 2)
+
+        self.episode_sums["energy"] += rew_energy
+        self.episode_sums["tracking_lin"] += rew_lin
+        self.episode_sums["tracking_ang"] += rew_ang
+        self.episode_sums["total"] += reward
+
+        return reward
+
+    # def _reward_gait_smooth(self):
+    #     ranges = self.gait_ranges[:, 1] - self.gait_ranges[:, 0]
+    #     learnable_mask = ranges > 1e-6
+    #     learnable_names = self.gait_param_names[learnable_mask.cpu().numpy()]
+    #     dgaits_eff = self.dgaits[:, learnable_mask]
+    #     ranges_eff = ranges[learnable_mask]
+
+    #     gaits_norm = dgaits_eff / ranges_eff
+    #     gait_smooth = torch.exp(-(gaits_norm ** 2).sum(dim=-1))
+    #     return gait_smooth, (gaits_norm, learnable_names)
+
+    def _reward_gait_smooth(self):
+        gaits = self.gaits
+        prev_gaits = self.last_gaits
+        ranges = self.gait_ranges[:, 1] - self.gait_ranges[:, 0]
+        dgaits_norm = (gaits - prev_gaits) / (ranges + 1e-6)
+        gait_smooth = torch.exp(-(dgaits_norm ** 2).sum(dim=-1))
+        return gait_smooth
+
+    def _reward_energy_regularization(self, power_total, lin_vel_mean, ang_vel_mean):
+        lin = torch.abs(lin_vel_mean[:, 0])
+        ang = torch.abs(ang_vel_mean[:, 2])
+
+        denom = (
+            self.cfg.rewards.energy_sigma_lin * lin
+            + self.cfg.rewards.energy_sigma_ang * ang
+        )
+        return torch.exp(-power_total / (denom + 1e-6))
+
+    def _reward_tracking_lin_vel(self, lin_vel_mean):
+        err = torch.sum(
+            (self.current_vel_cmds[:, :2] - lin_vel_mean[:, :2]) ** 2,
+            dim=1
+        )
+        return torch.exp(-err / self.cfg.rewards.tracking_sigma)
+
+    def _reward_tracking_ang_vel(self, ang_vel_mean):
+        err = (self.current_vel_cmds[:, 2] - ang_vel_mean[:, 2]) ** 2
+        return torch.exp(-err / self.cfg.rewards.tracking_sigma_yaw)
+
+    # def compute_CoT(self):
+    #     # P / (mgv)
+    #     P = torch.sum(torch.multiply(self.env.torques, self.env.dof_vel), dim=1)
+    #     m = 21.5 # (env.default_body_mass + env.payloads).cpu()
+    #     g = 9.81  # m/s^2
+    #     v = torch.norm(self.env.base_lin_vel[:, 0:2], dim=1)
+    #     return self.env.energy_consume / (m * g * v)
+
+    def compute_CoT(self):
+        m = 21.5
+        g = 9.81
+
+        # instantaneous mechanical power (always positive)
+        power = torch.sum(torch.abs(self.env.torques * self.env.dof_vel), dim=1)
+
+        # planar speed
+        v = torch.norm(self.env.base_lin_vel[:, :2], dim=1)
+
+        # avoid division blow-up
+        v = torch.clamp(v, min=0.1)
+
+        cot = power / (m * g * v)
+        return cot
+
+    def _get_noise_scale_vec(self, cfg):
+        """ Sets a vector used to scale the noise added to the observations.
+            [NOTE]: Must be adapted when changing the observations structure
+
+        Args:
+            cfg (Dict): Environment config file
+
+        Returns:
+            [torch.Tensor]: Vector of scales used to multiply a uniform distribution in [-1, 1]
+        """
+        noise_scales = self.cfg.noise_scales
+        noise_level = self.cfg.noise.noise_level
+
+        if self.cfg.env.observe_gravity:
+            noise_vec = torch.ones(3) * noise_scales.gravity * noise_level
+
+        # if self.cfg.env.observe_command:
+        #     noise_vec = torch.cat((torch.ones(3) * noise_scales.gravity * noise_level,
+        #                            torch.zeros(self.cfg.commands.num_commands)), dim=0)
+
+        if self.cfg.env.observe_command:
+            noise_vec = torch.zeros(self.cfg.commands.num_commands)
+
+        # if self.cfg.env.observe_command:
+        #     noise_vec = torch.cat((noise_vec,
+        #                            torch.zeros(self.cfg.commands.num_commands)), dim=0)
+
+        # noise_vec = torch.ones(3) * noise_scales.gravity * noise_level
+
+
+        if self.cfg.env.observe_timing_parameter:
+            noise_vec = torch.cat((noise_vec,
+                                   torch.zeros(1)), dim=0)
+
+        if self.cfg.env.observe_clock_inputs:
+            noise_vec = torch.cat((noise_vec,
+                                   torch.zeros(4)), dim=0)
+
+        if self.cfg.env.observe_vel:
+            noise_vec = torch.cat((torch.ones(3) * noise_scales.lin_vel * noise_level * self.obs_scales.lin_vel,
+                                   torch.ones(3) * noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel), dim=0)
+
+        if self.cfg.env.observe_only_ang_vel:
+            noise_vec = torch.cat((torch.ones(3) * noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel,
+                                   noise_vec), dim=0)
+
+        if self.cfg.env.observe_only_lin_vel:
+            noise_vec = torch.cat((torch.ones(3) * noise_scales.lin_vel * noise_level * self.obs_scales.lin_vel,
+                                   noise_vec), dim=0)
+
+        if self.cfg.env.observe_only_lin_vel_xy:
+            noise_vec = torch.cat((torch.ones(2) * noise_scales.lin_vel * noise_level * self.obs_scales.lin_vel,
+                                   noise_vec), dim=0)
+
+        if self.cfg.env.observe_only_ang_vel_z:
+            noise_vec = torch.cat((torch.ones(1) * noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel,
+                                   noise_vec), dim=0)
+
+        if self.cfg.env.observe_yaw:
+            noise_vec = torch.cat((noise_vec,
+                                   torch.zeros(1)), dim=0)
+
+        if self.cfg.env.observe_contact_states:
+            noise_vec = torch.cat((noise_vec,
+                                   torch.ones(4) * noise_scales.contact_states * noise_level), dim=0)
+
+        if self.cfg.env.observe_foot_forces:
+            noise_vec = torch.cat((noise_vec,
+                                   torch.ones(12) * noise_scales.foot_forces * noise_level), dim=0)
+
+        noise_vec = noise_vec.to(self.device)
+
+        return noise_vec
+
+    def _log_info(self):
+        log_dict = {
+            'command_x': self.env.commands[:, 0].cpu().numpy(),
+            'command_y': self.env.commands[:, 1].cpu().numpy(),
+            'command_yaw': self.env.commands[:, 2].cpu().numpy(),
+        }
+        log_dict['x_vel_cmd'] = self.current_vel_cmds[:, 0].item()
+        log_dict['base_pos_x'] = self.env.base_pos[:, 0].cpu().numpy()
+        log_dict['base_pos_y'] = self.env.base_pos[:, 1].cpu().numpy()
+        log_dict['base_pos_z'] = self.env.base_pos[:, 2].cpu().numpy()
+        log_dict['base_quat_x'] = self.env.base_quat[:, 0].cpu().numpy()
+        log_dict['base_quat_y'] = self.env.base_quat[:, 1].cpu().numpy()
+        log_dict['base_quat_z'] = self.env.base_quat[:, 2].cpu().numpy()
+        log_dict['base_quat_w'] = self.env.base_quat[:, 3].cpu().numpy()
+        log_dict['base_vel_x'] = self.env.base_lin_vel[:, 0].cpu().numpy()
+        log_dict['base_vel_y'] = self.env.base_lin_vel[:, 1].cpu().numpy()
+        log_dict['base_vel_z'] = self.env.base_lin_vel[:, 2].cpu().numpy()
+        log_dict['base_vel_roll'] = self.env.base_ang_vel[:, 0].cpu().numpy()
+        log_dict['base_vel_pitch'] = self.env.base_ang_vel[:, 1].cpu().numpy()
+        log_dict['base_vel_yaw'] = self.env.base_ang_vel[:, 2].cpu().numpy()
+        log_dict['contact_forces_x'] = self.env.contact_forces[:, self.env.feet_indices, 0].cpu().numpy()
+        log_dict['contact_forces_y'] = self.env.contact_forces[:, self.env.feet_indices, 1].cpu().numpy()
+        log_dict['contact_forces_z'] = self.env.contact_forces[:, self.env.feet_indices, 2].cpu().numpy()
+        # LL Reward
+        log_dict['reward'] = self.env.rew_buf[:].detach().clone().cpu().numpy()
+        log_dict['energy_consume'] = self.env.energy_consume[:].cpu().numpy()
+        log_dict['cot'] = self.env.cot[:].cpu().numpy()
+        log_dict['dof_pos'] = self.env.dof_pos.cpu().numpy()[:]
+        log_dict['dof_vel'] = self.env.dof_vel.cpu().numpy()[:]
+        log_dict['dof_acc'] = self.env.dof_acc.cpu().numpy()[:]
+        log_dict['dof_torque'] = self.env.torques.detach().clone().cpu().numpy()[:]
+        log_dict['action_scaled'] = self.env.actions.detach().clone().cpu().numpy()[:] # * env_cfg.control.action_scale
+
+        # Convert quaternion into yaw angle.
+        base_quat_x = self.env.base_quat[:, 0].cpu().numpy()
+        base_quat_y = self.env.base_quat[:, 1].cpu().numpy()
+        base_quat_z = self.env.base_quat[:, 2].cpu().numpy()
+        base_quat_w = self.env.base_quat[:, 3].cpu().numpy()
+
+        rotmat = R.from_quat(np.stack([base_quat_x, base_quat_y, base_quat_z, base_quat_w], axis=1)).as_matrix()
+        headdir = rotmat @ np.array([[1.0], [0.0], [0.0]])
+        log_dict['base_pos_yaw'] = np.arctan2(headdir[:, 1, 0], headdir[:, 0, 0])
+        self.logger.log_states(log_dict)
+'''

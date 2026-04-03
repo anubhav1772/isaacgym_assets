@@ -1680,80 +1680,76 @@ class LeggedRobot(BaseTask):
 
         return marker_handle
 
-    def sample_non_overlapping(self, origin_x, origin_y, room_x, room_y, placed, min_dist=1.0):
-        for _ in range(50):  # max attempts
-            x, y = self.sample_position(origin_x, origin_y, room_x, room_y)
+    def sample_terrain_aware_position(self, tile, origin_x, origin_y, existing_positions, radius):
 
-            valid = True
-            for px, py in placed:
-                if ((x - px)**2 + (y - py)**2) < (min_dist**2):
-                    valid = False
-                    break
+        H, W = tile.shape
+        scale = self.cfg.terrain.horizontal_scale
 
-            if valid:
-                return x, y
+        min_dist = 1.0
+        max_tries = 100
 
-        # fallback (if crowded)
-        return x, y
+        # convert object radius → grid clearance
+        clearance_cells = int(radius / scale) + 1
 
-    def sample_position(self, origin_x, origin_y, room_size_x, room_size_y):
-        x = origin_x + np.random.uniform(-room_size_x/2 + 1.0, room_size_x/2 - 1.0)
-        y = origin_y + np.random.uniform(-room_size_y/2 + 1.0, room_size_y/2 - 1.0)
-        return x, y
+        for _ in range(max_tries):
 
-    def get_candidate_positions(self, origin_x, origin_y, room_x, room_y, grid_size=3, margin=0.8):
-        xs = np.linspace(origin_x + margin, origin_x + room_x - margin, grid_size)
-        ys = np.linspace(origin_y + margin, origin_y + room_y - margin, grid_size)
-        return [(x, y) for x in xs for y in ys]
+            xi = np.random.randint(clearance_cells, H - clearance_cells)
+            yi = np.random.randint(clearance_cells, W - clearance_cells)
+
+            # must be free space
+            if tile[xi, yi] != 0:
+                continue
+
+            # strong clearance (prevents penetration)
+            if np.any(tile[
+                xi-clearance_cells:xi+clearance_cells,
+                yi-clearance_cells:yi+clearance_cells
+            ] > 0):
+                continue
+
+            # prefer near walls but not too close
+            near_wall = (
+                tile[xi+3, yi] > 0 or tile[xi-3, yi] > 0 or
+                tile[xi, yi+3] > 0 or tile[xi, yi-3] > 0
+            )
+
+            if not near_wall:
+                if np.random.rand() < 0.7:
+                    continue
+
+            # convert to world
+            x = origin_x + (xi - H//2) * scale
+            y = origin_y + (yi - W//2) * scale
+
+            # spacing constraint
+            if any(np.linalg.norm([x - px, y - py]) < min_dist for px, py in existing_positions):
+                continue
+
+            return x, y
+
+        # fallback random safe position
+        for _ in range(50):
+            xi = np.random.randint(5, H-5)
+            yi = np.random.randint(5, W-5)
+
+            if tile[xi, yi] == 0:
+                x = origin_x + (xi - H//2) * scale
+                y = origin_y + (yi - W//2) * scale
+
+                if not any(np.linalg.norm([x - px, y - py]) < 0.8 for px, py in existing_positions):
+                    return x, y
+
+        # final fallback (last resort)
+        return origin_x + np.random.uniform(-1, 1), origin_y + np.random.uniform(-1, 1)
+
+    def face_robot_quat(self, x, y, origin_x, origin_y):
+        yaw = np.arctan2(origin_y - y, origin_x - x)
+        return gymapi.Quat.from_euler_zyx(yaw, 0, 0)
 
 
-    def jitter(self, x, y, amount=0.2):
-        return (
-            x + np.random.uniform(-amount, amount),
-            y + np.random.uniform(-amount, amount)
-        )
-
-
-    def is_valid_position(self, x, y, origin_x, origin_y, room_x, room_y, wall_margin=0.5):
-        if x < origin_x + wall_margin: return False
-        if x > origin_x + room_x - wall_margin: return False
-        if y < origin_y + wall_margin: return False
-        if y > origin_y + room_y - wall_margin: return False
-        return True
-
-    def sample_local_positions(self, origin_x, origin_y, size=4.0, grid=3, margin=0.5):
-        xs = np.linspace(origin_x - size/2 + margin, origin_x + size/2 - margin, grid)
-        ys = np.linspace(origin_y - size/2 + margin, origin_y + size/2 - margin, grid)
-        return [(x, y) for x in xs for y in ys]
-
-    def is_valid_via_height(self, x, y, env_id):
-
-        # save original
-        original = self.root_states[env_id, :3].clone()
-
-        # move robot temporarily
-        self.root_states[env_id, 0] = x
-        self.root_states[env_id, 1] = y
-
-        heights = self._get_heights([env_id], self.cfg)
-
-        # restore
-        self.root_states[env_id, :3] = original
-
-        # check if terrain is reasonable
-        if torch.isnan(heights).any():
-            return False
-
-        if torch.abs(heights).mean() > 0.5:
-            return False
-
-        return True
-
-    def is_far_enough(self, x, y, placed, min_dist=1.0):
-        for px, py in placed:
-            if np.linalg.norm([x - px, y - py]) < min_dist:
-                return False
-        return True
+    def upright_quat_facing_robot(self, x, y, origin_x, origin_y):
+        yaw = np.arctan2(origin_y - y, origin_x - x)
+        return gymapi.Quat.from_euler_zyx(yaw, 0, 1.57)
 
     def _create_envs(self):
         """ Creates environments:
@@ -1916,6 +1912,14 @@ class LeggedRobot(BaseTask):
         )
         assert self.bag_asset is not None, "Bagpack asset NOT loaded"
 
+        OBJECT_RADII = {
+            "guitar": 0.4,
+            "shoes": 0.3,
+            "mug": 0.25,
+            "chair": 0.8,
+            "bag": 0.4
+        }
+
         for i in range(self.num_envs):
 
             # create env instance
@@ -1962,184 +1966,29 @@ class LeggedRobot(BaseTask):
 
             env_origin = self.env_origins[i]
 
-            # origin_x = float(env_origin[0].cpu())
-            # origin_y = float(env_origin[1].cpu())
-            #
-            # room_size = 4.0
-            #
-            # placed_positions = []
-            #
-            # candidates = self.sample_local_positions(origin_x, origin_y, size=room_size, grid=3)
-            # np.random.shuffle(candidates)
-            #
-            #
-            # def get_next_valid():
-            #     while candidates:
-            #         x, y = candidates.pop()
-            #
-            #         # small jitter
-            #         x += np.random.uniform(-0.2, 0.2)
-            #         y += np.random.uniform(-0.2, 0.2)
-            #
-            #         # LOCAL boundary check (correct)
-            #         if x < origin_x - room_size/2 + 0.3: continue
-            #         if x > origin_x + room_size/2 - 0.3: continue
-            #         if y < origin_y - room_size/2 + 0.3: continue
-            #         if y > origin_y + room_size/2 - 0.3: continue
-            #
-            #         # spacing check
-            #         if all(np.linalg.norm([x - px, y - py]) > 1.0 for px, py in placed_positions):
-            #             placed_positions.append((x, y))
-            #             return x, y
-            #
-            #     raise RuntimeError("No valid placement found")
-
-            # terrain_length = self.cfg.terrain.terrain_length * self.cfg.terrain.num_rows
-            # terrain_width  = self.cfg.terrain.terrain_width  * self.cfg.terrain.num_cols
-            #
-            # print(f"terrain len: {self.cfg.terrain.terrain_length}, terrain_width: {self.cfg.terrain.terrain_width}")
-            # print(f"terrain_rows: {self.cfg.terrain.num_rows}, terrain_cols: {self.cfg.terrain.num_cols}")
-            #
-            # half_x = terrain_length / 2
-            # half_y = terrain_width / 2
-            #
-            # margin = 2.0
-            #
-            # xs = np.linspace(-half_x + margin, half_x - margin, 5)
-            # ys = np.linspace(-half_y + margin, half_y - margin, 5)
-            #
-            # grid = [(x, y) for x in xs for y in ys]
-            #
-            # # shuffle grid
-            # np.random.shuffle(grid)
-            #
-            # # pick positions directly (NO rejection sampling)
-            # positions = grid[:5]
-
-            # Circular Layout
-            # origin_x = float(env_origin[0].cpu())
-            # origin_y = float(env_origin[1].cpu())
-            #
-            # num_objects = 5
-            #
-            # # multi-radius for proper spread (near → far)
-            # radii = [1.5, 2.5, 3.5, 4.2, 4.8]
-            #
-            # safe_radius = 5.0     # max allowed distance from center
-            # min_dist = 1.0        # object-object spacing
-            # max_tries = 25
-            #
-            # final_positions = []
-            #
-            # for k in range(num_objects):
-            #
-            #     placed = False
-            #
-            #     for _ in range(max_tries):
-            #
-            #         # spread angle with randomness
-            #         angle = 2 * np.pi * k / num_objects + np.random.uniform(-0.3, 0.3)
-            #
-            #         r = radii[k]
-            #
-            #         # base position
-            #         x = origin_x + r * np.cos(angle)
-            #         y = origin_y + r * np.sin(angle)
-            #
-            #         # jitter to escape obstacles
-            #         x += np.random.uniform(-0.4, 0.4)
-            #         y += np.random.uniform(-0.4, 0.4)
-            #
-            #         # boundary constraint (critical)
-            #         if np.linalg.norm([x - origin_x, y - origin_y]) > safe_radius:
-            #             continue
-            #
-            #         # spacing constraint
-            #         if any(np.linalg.norm([x - px, y - py]) < min_dist for px, py in final_positions):
-            #             continue
-            #
-            #         # lightweight terrain sanity
-            #         # (safe to keep or remove depending on stability)
-            #         if hasattr(self, "is_valid_terrain"):
-            #             try:
-            #                 if not self.is_valid_terrain(x, y):
-            #                     continue
-            #             except:
-            #                 pass
-            #
-            #         final_positions.append((x, y))
-            #         placed = True
-            #         break
-            #
-            #     if not placed:
-            #         print("⚠️ fallback placement used")
-            #         # fallback without jitter (still valid due to radius design)
-            #         angle = 2 * np.pi * k / num_objects
-            #         r = radii[k]
-            #         x = origin_x + r * np.cos(angle)
-            #         y = origin_y + r * np.sin(angle)
-            #         final_positions.append((x, y))
-
             origin_x = float(env_origin[0].cpu())
             origin_y = float(env_origin[1].cpu())
+            origin_z = env_origin[2].item()
 
-            num_objects = 5
-
-            # hybrid base layout (asymmetric, covers space well)
-            base_positions = [
-                (-2.0, -3.0),
-                ( 2.5, -1.5),
-                (-1.0,  1.5),
-                ( 2.0,  3.0),
-                ( 0.0,  0.0),
-            ]
-
-            safe_radius = 5.0
-            min_dist = 1.0
-            max_tries = 30
+            tile = self.terrain.height_field_raw
 
             final_positions = []
 
-            for (dx, dy) in base_positions:
+            gx, gy = self.sample_terrain_aware_position(tile, origin_x, origin_y, final_positions, OBJECT_RADII["guitar"])
+            final_positions.append((gx, gy))
 
-                placed = False
+            sx, sy = self.sample_terrain_aware_position(tile, origin_x, origin_y, final_positions, OBJECT_RADII["shoes"])
+            final_positions.append((sx, sy))
 
-                for _ in range(max_tries):
+            mx, my = self.sample_terrain_aware_position(tile, origin_x, origin_y, final_positions, OBJECT_RADII["mug"])
+            final_positions.append((mx, my))
 
-                    # base position relative to robot
-                    x = origin_x + dx
-                    y = origin_y + dy
+            cx, cy = self.sample_terrain_aware_position(tile, origin_x, origin_y, final_positions, OBJECT_RADII["chair"])
+            final_positions.append((cx, cy))
 
-                    # jitter for realism + obstacle avoidance
-                    x += np.random.uniform(-0.5, 0.5)
-                    y += np.random.uniform(-0.5, 0.5)
+            bx, by = self.sample_terrain_aware_position(tile, origin_x, origin_y, final_positions, OBJECT_RADII["bag"])
+            final_positions.append((bx, by))
 
-                    # boundary constraint
-                    if np.linalg.norm([x - origin_x, y - origin_y]) > safe_radius:
-                        continue
-
-                    # spacing constraint
-                    if any(np.linalg.norm([x - px, y - py]) < min_dist for px, py in final_positions):
-                        continue
-
-                    # optional terrain check
-                    if hasattr(self, "is_valid_terrain"):
-                        try:
-                            if not self.is_valid_terrain(x, y):
-                                continue
-                        except:
-                            pass
-
-                    final_positions.append((x, y))
-                    placed = True
-                    break
-
-                if not placed:
-                    print("fallback placement used")
-                    final_positions.append((origin_x + dx, origin_y + dy))
-
-            # unpack
-            (gx, gy), (sx, sy), (mx, my), (cx, cy), (bx, by) = final_positions
 
             # XXXXXXXXXXXXXXXXXXXXXXXXXX
             # GUITAR
@@ -2155,6 +2004,8 @@ class LeggedRobot(BaseTask):
 
             pose = gymapi.Transform()
             pose.p = gymapi.Vec3(gx, gy, gz - 1.3)
+            # pose.p = gymapi.Vec3(gx, gy, origin_z + 0.02)
+            # pose.r = self.upright_quat_facing_robot(gx, gy, origin_x, origin_y)
             pose.r = gymapi.Quat.from_euler_zyx(1.57, 0, 1.57 + 0.785)
 
             guitar_handle = self.gym.create_actor(
@@ -2195,6 +2046,9 @@ class LeggedRobot(BaseTask):
 
             pose = gymapi.Transform()
             pose.p = gymapi.Vec3(sx, sy, sz - 1.2)
+            # pose.r = self.face_robot_quat(sx, sy, origin_x, origin_y)
+            # pose.p = gymapi.Vec3(sx, sy, origin_z + 0.02)
+            # pose.r = self.face_robot_quat(sx, sy, origin_x, origin_y)
             pose.r = gymapi.Quat.from_euler_zyx(0, 0, 0)
 
             shoes_handle = self.gym.create_actor(
@@ -2234,6 +2088,9 @@ class LeggedRobot(BaseTask):
 
             pose = gymapi.Transform()
             pose.p = gymapi.Vec3(mx, my, mz - 2.0)
+            # pose.r = self.face_robot_quat(mx, my, origin_x, origin_y)
+            # pose.p = gymapi.Vec3(mx, my, origin_z + 0.02)
+            # pose.r = self.face_robot_quat(mx, my, origin_x, origin_y)
             pose.r = gymapi.Quat.from_euler_zyx(1.57, 0, 1.57)
 
             mug_handle = self.gym.create_actor(
@@ -2273,6 +2130,9 @@ class LeggedRobot(BaseTask):
 
             pose = gymapi.Transform()
             pose.p = gymapi.Vec3(cx, cy, cz - 3.0)
+            # pose.r = self.face_robot_quat(cx, cy, origin_x, origin_y)
+            # pose.p = gymapi.Vec3(cx, cy, origin_z + 0.02)
+            # pose.r = self.face_robot_quat(cx, cy, origin_x, origin_y)
             pose.r = gymapi.Quat.from_euler_zyx(1.57, 0, 1.57)
 
             chair_handle = self.gym.create_actor(
@@ -2312,6 +2172,9 @@ class LeggedRobot(BaseTask):
 
             pose = gymapi.Transform()
             pose.p = gymapi.Vec3(bx, by, bz - 2.0)
+            # pose.r = self.face_robot_quat(bx, by, origin_x, origin_y)
+            # pose.p = gymapi.Vec3(bx, by, origin_z + 0.02)
+            # pose.r = self.face_robot_quat(bx, by, origin_x, origin_y)
             pose.r = gymapi.Quat.from_euler_zyx(1.57, 0, 1.57)
 
             bag_handle = self.gym.create_actor(

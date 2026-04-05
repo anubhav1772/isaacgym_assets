@@ -23,6 +23,7 @@ from .legged_robot_config import BaseCfg
 # from isaac_bridge.camera_node import CameraPublisher
 
 import zmq
+import time
 import pickle
 
 class LeggedRobot(BaseTask):
@@ -182,11 +183,11 @@ class LeggedRobot(BaseTask):
         self.foot_positions = self.rigid_body_state.view(self.num_envs, self.num_bodies, 13)[:, self.feet_indices,
                               0:3]
 
-        # ===============================
-        # CAMERA + ROS PUBLISH HERE
-        # ===============================
+        # XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+        # CAMERA + IMU + ROS PUBLISH HERE
+        # XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
         # if self.common_step_counter % 10 == 0:
-        if True:
+        if self.common_step_counter % 3 == 0:  # ~10–15 Hz:
 
             # ALWAYS update graphics first
             self.gym.step_graphics(self.sim)
@@ -207,15 +208,54 @@ class LeggedRobot(BaseTask):
             )
 
             # reshape
-            rgb = rgb.reshape((480, 640, 4))[:, :, :3]
-            depth = -depth.reshape((480, 640))
+            # rgb = rgb.reshape((480, 640, 4))[:, :, :3]
+            # depth = -depth.reshape((480, 640))
 
-            # send
-            self.zmq_socket.send(pickle.dumps({
+            H = self.camera_intrinsics["height"]
+            W = self.camera_intrinsics["width"]
+
+            rgb = rgb.reshape((H, W, 4))[:, :, :3]
+            depth = depth.reshape((H, W))
+            depth = np.abs(depth)
+
+            # IMU
+            root_states = self.root_states
+
+            pos = root_states[0, 0:3]
+            quat = root_states[0, 3:7]
+            lin_vel = root_states[0, 7:10]
+            ang_vel = root_states[0, 10:13]
+
+            if not hasattr(self, "prev_lin_vel"):
+                self.prev_lin_vel = lin_vel
+
+            dt = self.dt
+            lin_acc = (lin_vel - self.prev_lin_vel) / dt
+            self.prev_lin_vel = lin_vel
+
+            # SEND
+            data = {
                 "rgb": rgb,
-                "depth": depth
-            }))
+                "depth": depth,
+                "intrinsics": self.camera_intrinsics,
 
+                "imu": {
+                    "quat": quat.cpu().numpy().tolist(),
+                    "ang_vel": ang_vel.cpu().numpy().tolist(),
+                    "lin_acc": lin_acc.cpu().numpy().tolist()
+                },
+
+                "pose": {
+                    "position": pos.cpu().numpy().tolist(),
+                    "orientation": quat.cpu().numpy().tolist(),
+                    "linear_velocity": lin_vel.cpu().numpy().tolist(),
+                    "angular_velocity": ang_vel.cpu().numpy().tolist()
+                },
+
+                "timestamp": float(time.time())
+            }
+
+            self.zmq_socket.send(pickle.dumps(data))
 
             # self.camera_node.publish(rgb, depth)
             # rclpy.spin_once(self.camera_node, timeout_sec=0.0)
@@ -1946,6 +1986,26 @@ class LeggedRobot(BaseTask):
             camera_props.width = 640
             camera_props.height = 480
             camera_props.enable_tensors = False #True
+            camera_props.horizontal_fov = 87.0  # closer to depth sensor
+
+            # CameraInfo (intrinsics)
+            W = camera_props.width
+            H = camera_props.height
+            fov = camera_props.horizontal_fov * np.pi / 180.0
+
+            fx = W / (2 * np.tan(fov / 2))
+            fy = fx
+            cx = W / 2.0
+            cy = H / 2.0
+
+            self.camera_intrinsics = {
+                "fx": fx,
+                "fy": fy,
+                "cx": cx,
+                "cy": cy,
+                "width": W,
+                "height": H
+            }
 
             camera_handle = self.gym.create_camera_sensor(env_handle, camera_props)
 
@@ -1955,7 +2015,7 @@ class LeggedRobot(BaseTask):
                 env_handle,
                 anymal_handle,  # robot actor
                 gymapi.Transform(
-                    gymapi.Vec3(0.3, 0.0, 0.2),  # forward, center, height
+                    gymapi.Vec3(0.3, 0.0, 0.2),         # forward, center, height
                     gymapi.Quat.from_euler_zyx(0, 0, 0)
                 ),
                 gymapi.FOLLOW_TRANSFORM

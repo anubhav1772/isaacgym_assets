@@ -52,7 +52,7 @@ Below is a list of currently available assets along with their locations in the 
 - **Person (Human Model)**  
   `resources/objects/person/`
 
-## 📌 Notes
+### 📌 Notes
 
 - Each asset directory typically contains:
   - `.urdf` file (used by Isaac Gym)
@@ -152,12 +152,59 @@ chair_texture = self.gym.create_texture_from_file(
       )
 ```
 
-## Smart Object Placement (Terrain-Aware)
+### Smart Object Placement (Terrain-Aware)
 
 To avoid floating or colliding objects, use terrain-aware sampling:
 
 ```bash
 def sample_terrain_aware_position(self, tile, origin_x, origin_y, existing_positions, radius):
 ```
+
+## Camera Setup in Isaac Gym
+
+### Create Camera
+
+```bash
+camera_props = gymapi.CameraProperties()
+camera_props.width = 640
+camera_props.height = 480
+camera_props.horizontal_fov = 60.0
+camera_props.enable_tensors = False  # CPU pipeline
+```
+
+### Attach Camera to Robot
+
+```bash
+self.gym.attach_camera_to_body(
+    camera_handle,
+    env_handle,
+    anymal_handle,
+    gymapi.Transform(
+        gymapi.Vec3(0.3, 0.0, 0.2),
+        gymapi.Quat.from_euler_zyx(0, 0, 0)
+    ),
+    gymapi.FOLLOW_TRANSFORM
+)
+```
+
+### Camera Intrinsics
+
+```bash
+fx = W / (2 * np.tan(fov / 2))
+fy = fx
+cx = W / 2
+cy = H / 2
+```
+
+### Capture RGB + Depth
+
+```bash
+rgb = self.gym.get_camera_image(self.sim, env, cam, gymapi.IMAGE_COLOR)
+depth = self.gym.get_camera_image(self.sim, env, cam, gymapi.IMAGE_DEPTH)
+
+rgb = rgb.reshape((H, W, 4))[:, :, :3]
+depth = np.abs(depth.reshape((H, W)))
+```
+
 
 

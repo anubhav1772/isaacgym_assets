@@ -636,3 +636,7 @@ class Terrain:
         env_origin_z = 0
 
         cfg.env_origins[row, col] = [env_origin_x, env_origin_y, env_origin_z]
+
+        room_center_x = cfg.terrain_length / 2.0 + cfg.x_offset * terrain.horizontal_scale
+        room_center_y = cfg.terrain_width / 2.0
+        cfg.room_center = np.array([room_center_x, room_center_y, 0.0], dtype=np.float32)

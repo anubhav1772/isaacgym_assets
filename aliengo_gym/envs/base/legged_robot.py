@@ -260,7 +260,7 @@ class LeggedRobot(BaseTask):
                     "linear_velocity": self.base_lin_vel[0].cpu().numpy().tolist(),
                     "angular_velocity": self.base_ang_vel[0].cpu().numpy().tolist()
                 },
-
+                "room_center": self.cfg.terrain.room_center.tolist(),
                 "timestamp": float(time.time())
             }
 

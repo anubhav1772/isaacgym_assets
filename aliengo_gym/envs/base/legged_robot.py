@@ -245,11 +245,20 @@ class LeggedRobot(BaseTask):
                     "lin_acc": lin_acc.cpu().numpy().tolist()
                 },
 
+                # "pose": {
+                #     "position": pos.cpu().numpy().tolist(),
+                #     "orientation": quat.cpu().numpy().tolist(),
+                #     "linear_velocity": lin_vel.cpu().numpy().tolist(),
+                #     "angular_velocity": ang_vel.cpu().numpy().tolist()
+                # },
+
                 "pose": {
                     "position": pos.cpu().numpy().tolist(),
                     "orientation": quat.cpu().numpy().tolist(),
-                    "linear_velocity": lin_vel.cpu().numpy().tolist(),
-                    "angular_velocity": ang_vel.cpu().numpy().tolist()
+
+                    # body-frame velocities for ROS Odometry twist
+                    "linear_velocity": self.base_lin_vel[0].cpu().numpy().tolist(),
+                    "angular_velocity": self.base_ang_vel[0].cpu().numpy().tolist()
                 },
 
                 "timestamp": float(time.time())

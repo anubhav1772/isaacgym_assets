@@ -83,6 +83,26 @@ class LeggedRobot(BaseTask):
         self.zmq_socket = self.zmq_context.socket(zmq.PUB)
         self.zmq_socket.bind("tcp://*:5555")
 
+        # ============================================================
+        # ROS2 / Nav2 -> Isaac Gym velocity command receiver
+        # ============================================================
+
+        self.external_navigation = True
+
+        self.nav_cmd_socket = self.zmq_context.socket(zmq.SUB)
+        self.nav_cmd_socket.connect("tcp://localhost:5556")
+        self.nav_cmd_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+
+        # Latest command received from Nav2
+        self.latest_nav_cmd = torch.zeros(3, device=self.device)
+
+        # Safety watchdog
+        self.last_nav_cmd_time = 0.0
+        self.nav_cmd_timeout = 0.5
+
+        # Start stationary
+        self.commands[0, 0:3] = 0.0
+
     def step(self, actions):
         """ Apply actions, simulate, call self.post_physics_step()
 
@@ -874,6 +894,54 @@ class LeggedRobot(BaseTask):
                                    self.com_displacements[env_id, 2])
         return props
 
+    def _receive_nav_command(self):
+        """Receive the latest Nav2 velocity command from ROS2."""
+
+        if not self.external_navigation:
+            return
+
+        latest = None
+
+        # Drain queued ZMQ messages and keep only the newest command.
+        while True:
+            try:
+                msg = self.nav_cmd_socket.recv(flags=zmq.NOBLOCK)
+                latest = pickle.loads(msg)
+
+            except zmq.Again:
+                break
+
+        if latest is not None:
+
+            vx = float(latest["vx"])
+            vy = float(latest["vy"])
+            wz = float(latest["w"])
+
+            # Keep Nav2 commands inside the velocity range used by the policy.
+            vx = np.clip(vx, self.cfg.commands.lin_vel_x[0], self.cfg.commands.lin_vel_x[1])
+            vy = np.clip(vy, self.cfg.commands.lin_vel_y[0], self.cfg.commands.lin_vel_y[1])
+            wz = np.clip(wz, self.cfg.commands.ang_vel_yaw[0], self.cfg.commands.ang_vel_yaw[1])
+
+            self.latest_nav_cmd[:] = torch.tensor([vx, vy, wz], dtype=torch.float, device=self.device)
+
+            self.last_nav_cmd_time = time.time()
+
+            print(f"[Isaac Nav2] vx={vx:.3f}, vy={vy:.3f}, wz={wz:.3f}")
+
+        # --------------------------------------------------------
+        # Watchdog
+        # --------------------------------------------------------
+        if time.time() - self.last_nav_cmd_time > self.nav_cmd_timeout:
+            self.latest_nav_cmd[:] = 0.0
+
+        # Environment 0 is the robot used by ROS/SLAM
+        self.commands[0, 0:3] = self.latest_nav_cmd
+
+        # print(
+        #     "[FULL CMD]",
+        #     self.commands[0].detach().cpu().numpy()
+        # )
+
     def _post_physics_step_callback(self):
         """ Callback called before computing terminations, rewards, and observations
             Default behaviour: Compute ang vel command based on target and heading, compute measured terrain heights and randomly push robots
@@ -888,8 +956,30 @@ class LeggedRobot(BaseTask):
         #    env_ids = (self.episode_length_buf % sample_interval == 0).nonzero(as_tuple=False).flatten()
         #    self._resample_commands(env_ids)
 
-        env_ids = (self.episode_length_buf % sample_interval == 0).nonzero(as_tuple=False).flatten()
-        self._resample_commands(env_ids)
+        # env_ids = (self.episode_length_buf % sample_interval == 0).nonzero(as_tuple=False).flatten()
+        # self._resample_commands(env_ids)
+
+        # ------------------------------------------------------------
+        # Command source
+        # ------------------------------------------------------------
+
+        if not self.external_navigation:
+
+            # Normal training / evaluation command sampling
+            sample_interval = int(
+                self.cfg.commands.resampling_time / self.dt
+            )
+
+            env_ids = (
+                self.episode_length_buf % sample_interval == 0
+            ).nonzero(as_tuple=False).flatten()
+
+            self._resample_commands(env_ids)
+
+        else:
+
+            # ROS2 / Nav2 controls vx, vy, wz
+            self._receive_nav_command()
 
         self._step_contact_targets()
 

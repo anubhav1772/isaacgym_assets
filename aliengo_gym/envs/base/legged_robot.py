@@ -90,15 +90,23 @@ class LeggedRobot(BaseTask):
         self.external_navigation = True
 
         self.nav_cmd_socket = self.zmq_context.socket(zmq.SUB)
+
+        # Keep only the newest velocity command.
+        self.nav_cmd_socket.setsockopt(zmq.RCVHWM, 1)
+        self.nav_cmd_socket.setsockopt(zmq.CONFLATE, 1)
+
         self.nav_cmd_socket.connect("tcp://localhost:5556")
         self.nav_cmd_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
-        # Latest command received from Nav2
-        self.latest_nav_cmd = torch.zeros(3, device=self.device)
+        # Latest command received from ROS2 / Nav2
+        self.latest_nav_cmd = torch.zeros(3, dtype=torch.float, device=self.device)
 
         # Safety watchdog
-        self.last_nav_cmd_time = 0.0
-        self.nav_cmd_timeout = 0.5
+        self.last_nav_cmd_time = time.monotonic()
+
+        # Use 1.0 s while debugging the transport.
+        # Once stable, you can reduce this again.
+        self.nav_cmd_timeout = 1.0
 
         # Start stationary
         self.commands[0, 0:3] = 0.0
@@ -895,52 +903,67 @@ class LeggedRobot(BaseTask):
         return props
 
     def _receive_nav_command(self):
-        """Receive the latest Nav2 velocity command from ROS2."""
+        """Receive the latest ROS2/Nav2 velocity command via ZMQ."""
 
         if not self.external_navigation:
             return
 
-        latest = None
-
-        # Drain queued ZMQ messages and keep only the newest command.
-        while True:
-            try:
-                msg = self.nav_cmd_socket.recv(flags=zmq.NOBLOCK)
-                latest = pickle.loads(msg)
-
-            except zmq.Again:
-                break
-
-        if latest is not None:
+        # ------------------------------------------------------------
+        # Receive newest command
+        # ------------------------------------------------------------
+        try:
+            msg = self.nav_cmd_socket.recv(flags=zmq.NOBLOCK)
+            latest = pickle.loads(msg)
 
             vx = float(latest["vx"])
             vy = float(latest["vy"])
             wz = float(latest["w"])
 
-            # Keep Nav2 commands inside the velocity range used by the policy.
+            # Keep commands inside the range seen during policy training.
             vx = np.clip(vx, self.cfg.commands.lin_vel_x[0], self.cfg.commands.lin_vel_x[1])
             vy = np.clip(vy, self.cfg.commands.lin_vel_y[0], self.cfg.commands.lin_vel_y[1])
             wz = np.clip(wz, self.cfg.commands.ang_vel_yaw[0], self.cfg.commands.ang_vel_yaw[1])
 
-            self.latest_nav_cmd[:] = torch.tensor([vx, vy, wz], dtype=torch.float, device=self.device)
+            self.latest_nav_cmd[0] = vx
+            self.latest_nav_cmd[1] = vy
+            self.latest_nav_cmd[2] = wz
 
-            self.last_nav_cmd_time = time.time()
+            self.last_nav_cmd_time = time.monotonic()
 
-            print(f"[Isaac Nav2] vx={vx:.3f}, vy={vy:.3f}, wz={wz:.3f}")
+        except zmq.Again:
+            # No new command this policy step.
+            # Keep using the most recently received command.
+            pass
 
-        # --------------------------------------------------------
+        # ------------------------------------------------------------
         # Watchdog
-        # --------------------------------------------------------
-        if time.time() - self.last_nav_cmd_time > self.nav_cmd_timeout:
-            self.latest_nav_cmd[:] = 0.0
+        # ------------------------------------------------------------
+        cmd_age = time.monotonic() - self.last_nav_cmd_time
 
-        # Environment 0 is the robot used by ROS/SLAM
+        if cmd_age > self.nav_cmd_timeout:
+            self.latest_nav_cmd.zero_()
+
+        # ------------------------------------------------------------
+        # Give velocity command to locomotion policy
+        # ------------------------------------------------------------
         self.commands[0, 0:3] = self.latest_nav_cmd
 
-        # print(
-        #     "[FULL CMD]",
-        #     self.commands[0].detach().cpu().numpy()
-        # )
+        # ------------------------------------------------------------
+        # Temporary controller diagnostics
+        # ------------------------------------------------------------
+        if self.common_step_counter % 10 == 0:
+            print(
+                f"[CONTROL] "
+                f"cmd=("
+                f"{self.commands[0,0].item():+.3f}, "
+                f"{self.commands[0,1].item():+.3f}, "
+                f"{self.commands[0,2].item():+.3f}) | "
+                f"actual=("
+                f"{self.base_lin_vel[0,0].item():+.3f}, "
+                f"{self.base_lin_vel[0,1].item():+.3f}, "
+                f"{self.base_ang_vel[0,2].item():+.3f}) | "
+                f"age={cmd_age:.3f}s"
+            )
 
     def _post_physics_step_callback(self):
         """ Callback called before computing terminations, rewards, and observations
